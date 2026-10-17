@@ -1,0 +1,11 @@
+-machine:i386
+-align:0x200
+-subsystem:native,4.00
+-debug:partial
+-base:0x10000
+-entry:DriverEntry
+-out:mmcsd9x.mpd
+-map:mmcsd9x.map
+-export:DriverEntry
+mmcmain.obj mmccmd.obj mmcsatl.obj mmcacpi.obj C:\DDK\BLOCK\LIB\scsiport.lib
+mmcsd9x.res

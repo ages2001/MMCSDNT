@@ -1,0 +1,331 @@
+MMCSDNT - test results for this release (QEMU 8.2 with the QEMU 9.1 SD/eMMC models)
+
+bin\NT\mmcsdnt.sys was built from these sources with i686 MinGW (GCC 13)
+against import libraries generated from NT 3.1's own SCSIPORT.SYS and
+NTOSKRNL.EXE exports; it imports nothing NT 3.1 lacks. src\NT\build.bat
+(MSVC 4.0 + NT4 DDK) builds the same sources. bin\9X\MMCSD9X.MPD was
+built from the same sources with MinGW as well (PE layout as from MSVC:
+file and section alignment 200h); src\9X\build.bat builds the same
+sources with MSVC. bin\2KXP\i386 and bin\2KXP\amd64\mmcsdnt.sys were
+built with MinGW (i686 / x86_64) against import libraries generated from
+Windows 2000's and XP x64's own SCSIPORT.SYS, NTOSKRNL.EXE and HAL.DLL;
+src\2KXP (DDK build) builds the same sources. The tests ran the debug
+builds of the same sources (DbgPrint to COM2).
+
+QEMU used for the tests
+- QEMU 8.2.2 with hw/sd/sd.c and core.c taken from QEMU 9.1 (the eMMC
+  model), patched (test environment only):
+  - The "emmc" device user-creatable, so it can sit on any SD bus.
+  - EMMC_CACHE=<KB>: the eMMC reports EXT_CSD revision 6 with a cache of
+    that size; FLUSH_CACHE completes at once. Without it the eMMC is
+    revision 3 (eMMC 4.3, no cache).
+  - SDHCI_ACPI=<address>,<isa irq>,<drive>[,emmc]: a system-bus SDHCI
+    (version 3.00) with an SD card or eMMC that no PCI function shows,
+    described only in the DSDT (Device SDHC, _HID 80860F14 or
+    SDHCI_ACPI_HID, _CRS Memory32Fixed 4 KB + Interrupt(edge, high,
+    exclusive), as a Name or, with SDHCI_ACPI_CRS=method, a Method
+    returning a named buffer); SDHCI_ACPI_PCI0=1 puts it under \_SB.PCI0
+    as the SoC firmwares do. SeaBIOS boots from it through the fw_cfg
+    file etc/sdcard0 (its address).
+- PCI hosts: QEMU's sdhci-pci (1B36:0007, class 08-05, programming
+  interface 01, one slot), sd-spec-version=3; capareg=057C34B4 adds the
+  8-bit bus capability (eMMC tests), capareg=057034B4 removes ADMA2
+  (SDMA-only host). SeaBIOS boots from SD cards and eMMC on these.
+- Cards: SD (QEMU: up to 2 GB SDSC, above SDHC/SDXC) and eMMC (up to
+  2 GB byte-addressed, above sector-addressed). QEMU sizes must be powers
+  of two; system images were padded and their FAT BPB head count set to
+  what SeaBIOS's translation gives for the new size where needed.
+- Tools (sources in the tools folder of the work tree, not shipped):
+  mmctest (GET_INFO, INQUIRY and VPD 00h/80h, READ CAPACITY(10)/(16),
+  REPORT LUNS, TEST UNIT READY, MODE SENSE all pages and caching page,
+  MODE SELECT WCE off/on, SYNCHRONIZE CACHE(10)/(16), VERIFY(10)/(12)/
+  (16), VERIFY past the end, READ(16)/WRITE(16)/READ(12)/WRITE(12) of
+  the last 16 blocks with compare and restore, START STOP UNIT
+  stop/read/start, POWER_DOWN / read wakes / POWER_DOWN / POWER_UP /
+  read), bench (sequential 1 MB, random 512 KB and 4 KB, QD32 4 KB,
+  final verify by CRC), sumtool (CRC of a directory tree against the
+  host-side files), geom, w95io (Windows 95 file write/read/compare),
+  pcap and pwr (power capabilities, hibernate).
+
+Speed modes, 64-bit ADMA2, command queuing, UNMAP, LOG SENSE, TRIM mode
+- QEMU additions for these tests (test environment only):
+  - SD_UHS=1: the SD card answers S18A in ACMD41, takes CMD11, drives
+    DAT[3:0] high again after the host's switch to 1.8 V, and offers
+    SDR50/SDR104/DDR50 in CMD6 (host: sdhci-pci uhs=1, capareg with the
+    SDR50/SDR104/DDR50 bits). SD_UHS_FAIL=1: the card accepts CMD11 but
+    DAT[3:0] stay low (failed switch).
+  - EMMC_EXT="index=value,...": EXT_CSD bytes set by hand (revision 7/8,
+    card type with DDR52/HS200/HS400, trim/discard support, erase and
+    trim multipliers, power-off long time, generic CMD6 time, pre-EOL
+    and life time estimates, command queue support and depth).
+  - EMMC_HS200_TUNE=1: the eMMC answers CMD21 with the HS200 tuning
+    block.
+  - SDHCI_CQE=1: a CQHCI 5.10 command queuing engine at +200h in the
+    sdhci-pci BAR (4 KB then); tasks are carried out with CMD18/CMD25/
+    CMD12 on the card after SDHCI_CQE_US microseconds (default 20), with
+    the task completion interrupt through SDHCI normal interrupt bit 14;
+    SDHCI_CQE_ERR=n reports a response error for the n-th task.
+  - Discard on the image (discard=unmap) to see unmapped blocks.
+- Windows 2000 SP4, debug build, SD 256 MB (spec 3, uhs=1) and eMMC
+  512 MB on two sdhci-pci hosts with 64-bit ADMA2 capability:
+  - SD: UHS-I SDR104 at 1.8 V, tuned after one block; 64-bit ADMA2
+    descriptors; UNMAP as erase (4 MB allocation unit), the blocks read
+    back changed; TRIM mode (an ordinary write is written, a pattern
+    write is unmapped). mmctest RESULT OK.
+  - eMMC (EXT_CSD revision 7, cache): without EMMC_HS200_TUNE the HS200
+    tuning fails, the card is set up again and runs DDR52 (8-bit DDR);
+    with it, HS200 at 200 MHz. Discard, power-off notification, life
+    time estimates 1/2/3 (LOG SENSE 11h: 30 % used), LOG SENSE 2Fh.
+    mmctest RESULT OK; sumtool, bench and CHKDSK OK on both cards.
+  - System shutdown: "power-off notification sent" (SRB_FUNCTION_SHUTDOWN
+    reaches the driver since it declares CachesData).
+  - SD_UHS_FAIL=1: "1.8 V switch failed, card powered off, set up again
+    at 3.3 V", then High Speed at 3.3 V; mmctest, sumtool, bench, CHKDSK
+    OK. HS400=1 and CQ=1 set without an engine: "no command queuing
+    engine at +200", nothing else changes.
+  - Default settings (no CQ=, no HS400=), with ScsiPort now told
+    TaggedQueuing and MultipleRequestPerLu: the same results as before, the queued I/O test (16 overlapped
+    64 KB transfers) OK on both cards.
+  - HS400=1, eMMC with HS400 in its card type and EMMC_HS200_TUNE: HS200
+    tuned, then HS_TIMING 1 at 52 MHz, 8-bit DDR, HS_TIMING 3, host
+    HS400 mode at 200 MHz, EXT_CSD read back: timing HS400; mmctest,
+    sumtool, bench, CHKDSK OK.
+  - CQ=1 with SDHCI_CQE=1 and a 4 GB sector-addressed eMMC (EXT_CSD
+    revision 8, command queue depth 32): "command queuing, 8 of 32
+    tasks, 128-bit descriptors", INQUIRY CmdQue 1, mmctest RESULT OK
+    (flush, UNMAP, MODE SELECT and the IOCTLs halt the engine and turn
+    the card's queue mode off in between), sumtool, bench, CHKDSK OK.
+    With SDHCI_CQE_US=3000 the queued I/O test had 8 tasks in flight
+    at once (the driver's maximum) and QD32 4 KB ran a third faster than on
+    the SD card of the same run.
+  - SDHCI_CQE_ERR=300: "queued task error, SDHCI 00004000, CQHCI
+    00000004", "command queuing off", the card set up again, the failed
+    tasks retried by the class driver: sumtool FILES 5 ERRORS 0, bench
+    0 errors, CHKDSK no problems.
+- Windows XP x64 SP1, release build: F6 text-mode setup from
+  bin\2KXP\floppy_amd64 (flat INF) onto a 4 GB sector-addressed eMMC on
+  an sdhci-pci host with the 64-bit system bus capability: no prompt in
+  text-mode setup (the driver loads from the floppy, partition, full
+  NTFS format, copy), first boot from the eMMC, GUI-mode setup installs
+  the controller from OemDir without a "Files Needed" prompt and
+  reaches Regional Options. Then 3 GB RAM with 2 GB above 4 GB and a
+  second sdhci-pci host (SD card) added: GUI-mode setup installs the
+  second host, again without a prompt. Through Shift+F10: GET_INFO flags
+  11h (interrupt path, 64-bit ADMA2), transfer method ADMA2-64; hmtest
+  on the SD card of the second host (1500 MB buffer reaching above
+  4 GB, 64 KB/8 KB/512-byte reads at buffer offsets 0/2/6, 2 rounds)
+  0 differ, 0 I/O errors;
+  mmctest on the system eMMC RESULT OK fails=0 (incl. UNMAP as erase
+  of a 1024-block group, TRIM mode, queued I/O, POWER_DOWN/UP); bench C:
+  RESULT OK 0 errors.
+- The command queuing engine and HS400 were tested only against this
+  emulation, not on real hosts.
+
+Windows 2000 SP4 (x86)
+- System disk on AHCI (AHCINT), MMCSDNT installed for data cards:
+  PCI SD (SDSC 256 MB, 4-bit, High Speed, 26 MHz from the 52 MHz base
+  clock) and PCI eMMC (512 MB, byte-addressed MMC, 52 MHz) on two
+  sdhci-pci functions: both adapters PnP-started (critical device
+  entries pci#cc_080501), interrupt-completed ADMA2. mmctest RESULT OK
+  on both; the eMMC without cache refuses WCE=1 with ILLEGAL REQUEST
+  26h as intended. sumtool FILES 5 ERRORS 0, chkdsk no problems, bench
+  RESULT OK 0 errors (50 MB) on both cards.
+- The same with the eMMC on an 8-bit host and EMMC_CACHE=1024: 8-bit
+  bus, "cache on", MODE SELECT turns the cache off and on again, flushes
+  on SYNCHRONIZE CACHE and power down; all tests OK.
+- SDHC: a 4 GB SD card (FAT32): SDHC/SDXC, block addressing, all
+  tests OK.
+- SDMA-only host (capareg without ADMA2): SDMA through the 64 KB bounce
+  buffer, all tests OK. QEMU's SDHCI ignores an SDMA address written at
+  a buffer boundary while the transfer is still marked active, so a
+  transfer that crosses one stalls there; the driver now never sets one
+  up that crosses a boundary (one physically contiguous bounce range
+  within a 512 KB window, 512 KB boundary programmed).
+- DMA=0: every slot PIO, all tests OK on both cards.
+- Boot from SD: the system image (2 GB, SDSC) as an SD card on
+  sdhci-pci, nothing else: SeaBIOS boots it, MMCSDNT starts from the
+  critical device database, mmctest on the system card RESULT OK
+  (including POWER_DOWN/POWER_UP of the system disk), bench OK.
+- Boot from eMMC: the same image as eMMC on an 8-bit host with the
+  cache: 8-bit, 52 MHz, cache on, tests OK.
+- ACPI-only SD host (SDHCI_ACPI, under \_SB.PCI0, memory 90000000h,
+  IRQ 5 edge), data card and then boot from it:
+  - First builds: the device node got code 10. Traced: ScsiPort 5.0
+    takes the bus type of a PDO from LegacyInterfaceType (device key),
+    a known bus type GUID or the legacy bus type, and Isa when none is
+    there (ACPI nodes report none); the PnpInterface value "1" written
+    after "15" was read as 15 (the name buffer is not cleared between
+    values), so Isa was not PnP for the driver and the start failed
+    with STATUS_NO_SUCH_DEVICE before HwFindAdapter. Fixed: DriverEntry
+    registers PCIBus, Internal, Isa and PNPBus, and PnpInterface is
+    written 0, 1, 5, 15. With the ACPI node directly under \_SB, Windows
+    2000's ACPI.SYS itself stopped with 0x1E while arbitrating the
+    interrupt (no driver involved); under \_SB.PCI0, as on real SoCs, it
+    starts, and the memory range has to lie inside PCI0's window.
+  - Data card: GET_INFO flags 5 (ACPI, interrupt path), mmctest, sumtool,
+    chkdsk, bench all OK.
+  - Boot from the ACPI host (SeaBIOS through etc/sdcard0): boots,
+    mmctest and bench OK.
+- Hibernation with Windows 2000 booted from the PCI SD card (Cirrus
+  VGA; the std VGA without a driver makes Windows 2000 refuse S3/S4,
+  as noted for IDENT): pcap S3 1 S4 1; hibernate loads the dump instance
+  ("DriverEntry (dump)", FindAdapter on the boot host, Fast Polling)
+  and writes the hibernation file; after a restart Windows resumes and
+  the batch goes on: mmctest RESULT OK, bench RESULT OK.
+- Note: the first run after adding the cards had D: unreadable for a
+  while (sumtool FILES 0, bench "path not found") while chkdsk later
+  found it fine; it did not happen again in any later run and looks like
+  the Found New Hardware installation of the new disks remounting the
+  volume. Recorded here in case it shows up on real hardware.
+
+Windows XP x64 Edition SP1 (amd64)
+- F6 text-mode setup from bin\2KXP\floppy_amd64 onto an 8 GB eMMC
+  (sector-addressed, 8-bit host) on sdhci-pci, CD on the PIIX3: the
+  driver loads from the floppy ("Parameters\PnpInterface added", PCI
+  adapter, interrupt path), setup lists "8190 MB Disk 0 at Id 0 on bus 0
+  on MMCSDNT", partitions, formats (NTFS, full format) and copies;
+  SeaBIOS boots the eMMC, GUI-mode setup installs the controller from
+  the INF in OemDir (unsigned driver prompt answered Yes) and reaches
+  Regional Options without a "Files Needed" prompt. The rest of
+  GUI-mode setup was not run (product key), as with AHCINT, IDENT and
+  nvme2k.
+- At Regional Options, through Shift+F10 with the tools on a floppy:
+  mmctest on the system eMMC RESULT OK fails=0 (sector-addressed, OCR
+  C0FFFF00, 8-bit, 52 MHz; POWER_DOWN/POWER_UP of the system disk),
+  bench C: RESULT OK 0 errors (~7 MB/s sequential).
+- The full format of 8 GB took about an hour in this QEMU: text-mode
+  setup reads the whole partition back (SCSI VERIFY, polled), and QEMU's
+  SD model moves 3-4 MB/s polled. Real cards are much faster.
+
+Windows NT 4.0 SP6 (x86)
+- System disk on the PIIX3 (IDENT). MMCSDNT installed through
+  bin\NT\oemsetup.inf (SETUP.EXE -f -i with an INF that calls its
+  InstallOption, DoConfig): service MMCSDNT, Start 0, Group SCSI
+  Miniport, Tag, BinaryPathName, disk class driver Start 0.
+- First data run: Tag 30 (in NT 4.0's GroupOrderList, before IDENT's):
+  MMCSDNT's cards became disk 0 and C: moved to the SD card. The Tag is
+  now 41 (not in the list), and the system kept C:.
+- PCI SD (SDSC) and PCI eMMC (8-bit, cache): one adapter each from the
+  driver's own PCI scan, interrupt path (INTx 11 and 10): mmctest
+  RESULT OK on both, sumtool FILES 5 ERRORS 0, bench RESULT OK.
+- ACPI-only SD host: at first "ACPI: RSDP at 000F52A0, 4 table(s), 0 SD
+  host controller(s)": the RSDT and FADT were intact but the DSDT at the
+  top of RAM was already overwritten. SeaBIOS reports that area as RAM
+  through INT 15h E801 (only its E820 map marks it reserved), and NT 4.0
+  uses it. With /MAXMEM=240 in boot.ini: "ACPI: 80860F14 at 90000000,
+  interrupt 5 (edge)", the host is an adapter on the EISA bus handler,
+  interrupt path, mmctest/sumtool/bench all OK.
+- Boot from SD: the system image (padded to 512 MB) as an SD card on
+  sdhci-pci: boots (multi(0) through SeaBIOS), mmctest RESULT OK, bench
+  RESULT OK (~9 MB/s). The first try had the BPB head count set to 32,
+  which is what SeaBIOS's IDE translation gives for 512 MB; its LBA
+  translation for the SD card keeps 16 heads at this size ("BOOT: I/O
+  error reading disk") - test setup, not driver.
+- Boot from the ACPI-only SD host (/MAXMEM=240): boots, the host found
+  in the tables, interrupt path, mmctest and bench OK.
+
+Windows NT 3.1 (x86)
+- System disk on the PIIX3 (IDENT). MMCSDNT entered with regtool
+  (no SCSI Adapters applet for added drivers on NT 3.1).
+- With Tag 29h MMCSDNT loaded before the untagged IDENT and its SD card
+  became disk 0: smss stopped with 0x6B (C0000034/3A, \winnt31 not
+  found). Without a Tag value it loads after IDENT (see README, Tag and
+  disk numbering).
+- PCI SD, PCI eMMC (8-bit, cache) and ACPI-only SD (/MAXMEM=240): 40h
+  HW_INITIALIZATION_DATA retry, PCI through CF8h/CFCh ("no HAL config
+  access, mechanism #1 used"), PCI hosts on the EISA bus with Fast
+  Polling (no IRQ=1), the ACPI host interrupt-driven (IRQ 5 edge):
+  mmctest RESULT OK on all three, sumtool FILES 5 ERRORS 0, bench RESULT
+  OK on all three volumes.
+- NT 3.1's FASTFAT.SYS stops with 0x1E (in FASTFAT, while autochk checks
+  the volume) on a 512 MB FAT16 volume made by mkfs.fat (16 sectors per
+  cluster) - the same image on the IDE controller through IDENT does the
+  same, so not driver-related. The NT 3.1 tests used 256 MB volumes.
+- Boot from SD: the system image (padded to 512 MB) as an SD card on
+  sdhci-pci: boots, Fast Polling, mmctest and bench RESULT OK.
+
+Windows 95 (RTM, x86)
+- PCI SD card: New Hardware Found (PCI Card) -> Driver from disk ->
+  C:\MMC -> MMCSD9x SD/MMC/eMMC Storage Controller: the miniport loads at
+  once (no restart), one adapter, Fast Polling.
+- The first build hung Windows 95 at the next boot (in V86 mode,
+  executing text-mode screen memory): SCSIPORT.PDR's uncached extension
+  is not guaranteed to be physically contiguous, and the build placed
+  the ADMA2 tables on the page after the scratch buffer at "base +
+  4 KB"; reads went where the wrong descriptor table pointed. Fixed:
+  every page of the DMA area gets its own physical address; with that
+  build the boot completes and the card works.
+- PCI SD: sumtool FILES 5 ERRORS 0, w95io (32 MB write/read/compare)
+  RESULT OK. The card also appears a second time (E:) in MS-DOS
+  compatibility mode, because SeaBIOS serves it through INT 13h and
+  Windows 95 does not match that BIOS drive to the protected-mode one;
+  AHCINT's tests saw the same with SeaBIOS's AHCI disks.
+- ACPI-only SD host: Add New Hardware -> SCSI controllers -> Have Disk
+  -> "MMCSD9x SD/MMC/eMMC Storage Controller (ACPI host, no PnP id)":
+  the driver loads for the root device node, its HwFindAdapter (Isa, no
+  ranges) finds 80860F14 at 90000000 in the ACPI tables, the card comes
+  up and Windows opens the new drive at once; after a restart sumtool
+  FILES 5 ERRORS 0, w95io RESULT OK (no second copy: SeaBIOS does not
+  see this host).
+- SCSIPORT.PDR calls HwFindAdapter once per device node and ignores
+  *Again, so an ACPI host cannot be picked up through a PCI host's node;
+  hence the manual model for Windows 95.
+
+Memory: 4 GB RAM and PAE
+- QEMU -m 4096 on i440FX: 3 GB below 4 GB, 1 GB above it (a CPU with
+  PAE where the guest needs it).
+- Windows 2000 Professional, boot.ini /PAE (stock ntkrnlpa.exe), booted
+  from the PCI SD card: 3071 MB used (highest page BFFDF; Professional
+  uses no memory above 4 GB), DMA area at 090E6000, mmctest RESULT OK,
+  bench RESULT OK; the same with the release build.
+- Windows NT 4.0 with 4 GB, booted from the PCI SD card: highest page
+  BFFDF, mmctest and bench RESULT OK.
+- Windows NT 3.1 with 4 GB (Pentium II CPU model), booted from the PCI
+  SD card: mmctest and bench RESULT OK.
+- Windows 95 with 4 GB and MaxPhysPage=3FFFF / MaxFileCache=262144 in
+  SYSTEM.INI (Windows 95 needs these with more than about 1 GB): PCI SD
+  card sumtool FILES 5 ERRORS 0, w95io RESULT OK.
+- Windows XP x64 booted from the 8 GB eMMC with 3 GB RAM of which 2 GB
+  above the 4 GB line (max-ram-below-4g=1G; highest page 17FFFF), a
+  second sdhci-pci with a 1 GB SD card as scratch: hmtest on the scratch
+  card (1500 MB buffer touched first, so most of it lies above 4 GB;
+  64 KB, 8 KB and 512-byte reads and writes into page-aligned buffers
+  and buffers 2 and 6 bytes off a dword boundary, 2 rounds): 0 differ,
+  0 I/O errors; bench C: RESULT OK; mmctest on the system eMMC RESULT
+  OK. Run with the release build of this version.
+- In these runs ScsiPort always kept the DMA area below 4 GB; the PIO
+  fallback for a DMA area above 4 GB (this version) was not triggered.
+- XP x64: GUI-mode setup of the image installed earlier from a floppy
+  carrying the INF with the i386\ / amd64\ subdirectories asked for
+  OemDir\amd64\MMCSDNT.sys ("Files Needed") when the second SD host
+  was added; the F6 disks now carry the flat INF, as IDENT's do.
+
+Not tested
+- Windows 98/Me, Windows XP x86, Server 2003: no images in this
+  environment. The 98/Me path (ACPI device nodes) and the XP/2003 x86
+  path are the same code as the tested 95 / 2000 / XP x64 paths.
+- Several slots on one PCI function: QEMU's sdhci-pci has one slot.
+- Real SD hosts and cards (timing, UHS cards in High Speed mode, cards
+  that need more power-up time than QEMU's).
+
+Final binaries
+- This release (bin\ as shipped): Windows 2000 with SD and eMMC cards
+  next to AHCINT, IDENT and NVMENT data disks: mmctest RESULT OK on both
+  cards, trimnt on every volume (all five adapters switched to TRIM
+  mode; 247 MB / 503 MB of free space unmapped), sumtool FILES 5 ERRORS
+  0 and CHKDSK clean on all volumes. NT 4.0 (system disk through IDENT):
+  mmctest RESULT OK on the PCI SD card, the PCI eMMC and the ACPI-only SD
+  host, trimnt, sumtool, bench and CHKDSK OK on the three cards. Windows
+  95: MMCSD9X with the PCI SD card, sumtool FILES 5 ERRORS 0, w95io
+  RESULT OK. XP x64: see above.
+- The debug build of this release on Windows 2000: every driver got
+  SRB_FUNCTION_SHUTDOWN at system shutdown ("power-off notification
+  sent" for the eMMC).
+- The tests above ran the debug builds. The release builds in bin\ were
+  run again: Windows 2000 booted from the PCI SD card (mmctest and bench
+  RESULT OK), NT 4.0 booted from the PCI SD card (mmctest and bench
+  RESULT OK), Windows 95 with the PCI SD card (sumtool FILES 5 ERRORS 0,
+  w95io RESULT OK).
+- This version (DMA area above 4 GB falls back to PIO, 64-bit BARs
+  above 4 GB skipped) ran in its release build on Windows 2000 /PAE with
+  4 GB and on XP x64 with 2 GB above 4 GB, see the memory section.

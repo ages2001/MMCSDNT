@@ -1,0 +1,202 @@
+; MMCSDNT.inf
+; Windows 2000 / XP / Server 2003 (x86) and XP x64 / Server 2003 x64 (amd64)
+; SD/SDHC/SDXC and MMC/eMMC Storage Controller Driver Installation File
+; Copyright (c) 2026 ages2001
+
+[Version]
+Signature="$Windows NT$"
+Class=SCSIAdapter
+ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider=%ProviderString%
+DriverVer=10/12/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12  ; DIRID_DRIVERS
+
+;-------------------------------------------------------------------------------
+;                    Source disks
+;-------------------------------------------------------------------------------
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksNames.x86]
+1 = %DiskName%,,,\i386
+
+[SourceDisksNames.amd64]
+1 = %DiskName%,,,\amd64
+
+[SourceDisksFiles]
+MMCSDNT.sys=1
+
+[SourceDisksFiles.x86]
+MMCSDNT.sys=1
+
+[SourceDisksFiles.amd64]
+MMCSDNT.sys=1
+
+;-------------------------------------------------------------------------------
+;                    Models
+;-------------------------------------------------------------------------------
+
+[Manufacturer]
+%VendorString%=Mmc_Models,NTx86,NTamd64
+
+[Mmc_Models]
+; SD host controllers following the SDHCI register layout: PCI class 08/05
+; with programming interface 00 (no DMA) or 01 (DMA)
+%Mmc.DeviceDesc.x86% = Mmc_Inst, PCI\CC_080500
+%Mmc.DeviceDesc.x86% = Mmc_Inst, PCI\CC_080501
+; Controllers described only by ACPI (SoC hosts): the generic SD host id
+; and the ids of the common Intel and AMD SDHCI hosts
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\PNP0D40
+%Mmc.DeviceDesc.x86% = Mmc_Inst, *PNP0D40
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80860F14
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80860F16
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\INT33BB
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\INT3436
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80865ACA
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80865ACC
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80865AD0
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\AMDI0040
+
+[Mmc_Models.NTx86]
+; SD host controllers following the SDHCI register layout: PCI class 08/05
+; with programming interface 00 (no DMA) or 01 (DMA)
+%Mmc.DeviceDesc.x86% = Mmc_Inst, PCI\CC_080500
+%Mmc.DeviceDesc.x86% = Mmc_Inst, PCI\CC_080501
+; Controllers described only by ACPI (SoC hosts): the generic SD host id
+; and the ids of the common Intel and AMD SDHCI hosts
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\PNP0D40
+%Mmc.DeviceDesc.x86% = Mmc_Inst, *PNP0D40
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80860F14
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80860F16
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\INT33BB
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\INT3436
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80865ACA
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80865ACC
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\80865AD0
+%Mmc.DeviceDesc.x86% = Mmc_Inst, ACPI\AMDI0040
+
+[Mmc_Models.NTamd64]
+; SD host controllers following the SDHCI register layout: PCI class 08/05
+; with programming interface 00 (no DMA) or 01 (DMA)
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, PCI\CC_080500
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, PCI\CC_080501
+; Controllers described only by ACPI (SoC hosts): the generic SD host id
+; and the ids of the common Intel and AMD SDHCI hosts
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\PNP0D40
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, *PNP0D40
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\80860F14
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\80860F16
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\INT33BB
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\INT3436
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\80865ACA
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\80865ACC
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\80865AD0
+%Mmc.DeviceDesc.amd64% = Mmc_Inst, ACPI\AMDI0040
+
+;-------------------------------------------------------------------------------
+;                    Installation
+;-------------------------------------------------------------------------------
+; Every card is a fixed disk (bootable). The SDHCI register blocks come from
+; the PCI BARs (one slot per BAR as the slot information register gives) or
+; from the Memory32Fixed/Interrupt resources of the ACPI node.
+;
+; Parameters\PnpInterface: 5 for PCI functions; 1 (Isa, which ScsiPort takes
+; for an ACPI node that reports no bus type), 0 and 15 for ACPI nodes. The
+; names must stay in this order (ScsiPort 5.0 reads a short name over the
+; buffer of a longer one).
+
+[Mmc_Inst]
+CopyFiles = Mmc_CopyFiles
+AddReg    = Mmc_Cdd_AddReg
+
+[Mmc_Inst.Services]
+AddService = MMCSDNT, %SPSVCINST_ASSOCSERVICE%, Mmc_Service_Inst, Miniport_EventLog_Inst
+
+[Mmc_Service_Inst]
+ServiceType    = %SERVICE_KERNEL_DRIVER%
+StartType      = %SERVICE_BOOT_START%
+ErrorControl   = %SERVICE_ERROR_NORMAL%
+ServiceBinary  = %12%\MMCSDNT.sys
+LoadOrderGroup = SCSI Miniport
+AddReg         = Mmc_AddReg
+
+[Mmc_AddReg]
+HKR,"Parameters\PnpInterface","0",%REG_DWORD%,1
+HKR,"Parameters\PnpInterface","1",%REG_DWORD%,1
+HKR,"Parameters\PnpInterface","5",%REG_DWORD%,1
+HKR,"Parameters\PnpInterface","15",%REG_DWORD%,1
+
+[Mmc_CopyFiles]
+MMCSDNT.sys
+
+; A controller that appears later (other slot, new board) starts with
+; MMCSDNT at boot as well
+[Mmc_Cdd_AddReg]
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\pci#cc_080500","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\pci#cc_080500","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\pci#cc_080501","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\pci#cc_080501","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#pnp0d40","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#pnp0d40","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\*pnp0d40","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\*pnp0d40","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80860f14","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80860f14","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80860f16","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80860f16","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#int33bb","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#int33bb","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#int3436","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#int3436","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80865aca","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80865aca","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80865acc","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80865acc","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80865ad0","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#80865ad0","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#amdi0040","Service",,"MMCSDNT"
+HKLM,"System\CurrentControlSet\Control\CriticalDeviceDatabase\acpi#amdi0040","ClassGUID",,"{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+
+[Miniport_EventLog_Inst]
+AddReg = Miniport_EventLog_AddReg
+
+[Miniport_EventLog_AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[Strings]
+ProviderString       = "ages2001"
+VendorString         = "Standard SD Host Controller"
+Mmc.DeviceDesc.x86   = "MMCSDNT SD/MMC/eMMC Storage Controller"
+Mmc.DeviceDesc.amd64 = "MMCSDNT SD/MMC/eMMC Storage Controller (x64)"
+DiskName             = "MMCSDNT SD/MMC Driver Disk"
+
+; Service install flags
+SPSVCINST_ASSOCSERVICE = 0x00000002
+
+; Service Type
+SERVICE_KERNEL_DRIVER  = 1
+
+; Service Start Type
+SERVICE_BOOT_START     = 0
+SERVICE_SYSTEM_START   = 1
+SERVICE_AUTO_START     = 2
+SERVICE_DEMAND_START   = 3
+SERVICE_DISABLED       = 4
+
+; Service Error Control
+SERVICE_ERROR_IGNORE   = 0
+SERVICE_ERROR_NORMAL   = 1
+SERVICE_ERROR_SEVERE   = 2
+SERVICE_ERROR_CRITICAL = 3
+
+; Registry types
+REG_SZ         = 0x00000000
+REG_MULTI_SZ   = 0x00010000
+REG_EXPAND_SZ  = 0x00020000
+REG_BINARY     = 0x00000001
+REG_DWORD      = 0x00010001
+REG_NONE       = 0x00020001

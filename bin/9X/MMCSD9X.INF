@@ -1,0 +1,68 @@
+; MMCSD9X.INF
+; Windows 9x Installation File for the MMCSDNT SD/MMC/eMMC Storage Controller Driver
+; Copyright (c) 2026 ages2001
+;
+; Every card is a fixed disk. The miniport finds the SDHCI register blocks
+; from the PCI BARs, or for a controller only ACPI describes (Windows 98/Me
+; device node, or BASE= in the driver parameters) from the ACPI tables
+; itself. Transfers run with Fast Polling unless IRQ=1 is set in the driver
+; parameters.
+
+[Version]
+Signature="$CHICAGO"
+Class=SCSIAdapter
+ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider=%ProviderString%
+DriverVer=10/12/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,
+
+[SourceDisksFiles]
+MMCSD9X.MPD = 1
+
+[Manufacturer]
+%VendorString%=MMC_Models
+
+[MMC_Models]
+; PCI class 08/05 (SD host controller) with programming interface 00 and
+; 01, and the ACPI ids of SD host controllers
+%MMC.DeviceDesc% = MMC_Inst, PCI\CC_080500
+%MMC.DeviceDesc% = MMC_Inst, PCI\CC_080501
+%MMC.DeviceDesc% = MMC_Inst, ACPI\PNP0D40
+%MMC.DeviceDesc% = MMC_Inst, *PNP0D40
+%MMC.DeviceDesc% = MMC_Inst, ACPI\80860F14
+%MMC.DeviceDesc% = MMC_Inst, ACPI\80860F16
+%MMC.DeviceDesc% = MMC_Inst, ACPI\INT33BB
+%MMC.DeviceDesc% = MMC_Inst, ACPI\INT3436
+%MMC.DeviceDesc% = MMC_Inst, ACPI\80865ACA
+%MMC.DeviceDesc% = MMC_Inst, ACPI\80865ACC
+%MMC.DeviceDesc% = MMC_Inst, ACPI\80865AD0
+%MMC.DeviceDesc% = MMC_Inst, ACPI\AMDI0040
+; Windows 95 (no ACPI device nodes): installed by hand through Add New
+; Hardware; the driver finds the controller in the ACPI tables itself
+%MMC.AcpiDesc% = MMC_Inst, MMCSD_ACPI_HOST
+
+[MMC_Inst]
+CopyFiles = MMC_CopyFiles
+AddReg = IOS, MMC_AddReg_9x
+
+[MMC_CopyFiles]
+MMCSD9X.MPD
+
+[IOS]
+HKR,,DevLoader,,*IOS
+HKR,,DontLoadIfConflict,,"Y"
+
+[MMC_AddReg_9x]
+HKR,,PortDriver,,MMCSD9X.MPD
+
+[Strings]
+ProviderString = "ages2001"
+VendorString = "Standard SD Host Controller"
+MMC.DeviceDesc = "MMCSD9x SD/MMC/eMMC Storage Controller"
+MMC.AcpiDesc = "MMCSD9x SD/MMC/eMMC Storage Controller (ACPI host, no PnP id)"
+DiskName = "MMCSDNT SD/MMC Storage Controller Installation Disk"

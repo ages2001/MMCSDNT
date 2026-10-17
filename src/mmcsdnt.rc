@@ -1,0 +1,51 @@
+//
+// mmcsdnt.rc - version resource of mmcsdnt.sys / mmcsd9x.mpd
+//
+
+#include <winver.h>
+
+#define MMC_VER_NUM              1,0,0,0
+#define MMC_VER_STR              "1.0.0.0"
+
+#ifdef MMC_W9X
+#define MMC_FILE_STR             "mmcsd9x.mpd"
+#define MMC_DESCRIPTION_STR      "mmcsd9x SD/MMC/eMMC Storage Controller Miniport Driver"
+#define MMC_FILEOS               VOS_DOS_WINDOWS32
+#else
+#define MMC_FILE_STR             "mmcsdnt.sys"
+#define MMC_DESCRIPTION_STR      "mmcsdnt SD/MMC/eMMC Storage Controller Miniport Driver"
+#define MMC_FILEOS               VOS_NT_WINDOWS32
+#endif
+
+#ifdef RC_INVOKED
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     MMC_VER_NUM
+PRODUCTVERSION  MMC_VER_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          MMC_FILEOS
+FILETYPE        VFT_DRV
+FILESUBTYPE     VFT2_DRV_SYSTEM
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "ages2001"
+            VALUE "FileDescription",  MMC_DESCRIPTION_STR
+            VALUE "FileVersion",      MMC_VER_STR
+            VALUE "InternalName",     MMC_FILE_STR
+            VALUE "LegalCopyright",   "Copyright (C) 2026 ages2001"
+            VALUE "OriginalFilename", MMC_FILE_STR
+            VALUE "ProductName",      "MMCSDNT"
+            VALUE "ProductVersion",   MMC_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+#endif

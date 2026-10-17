@@ -1,0 +1,57 @@
+#
+# TXTSETUP.OEM - MMCSDNT SD/MMC/eMMC Driver for NT 3.1 - 4.0 text-mode setup
+#
+# This file is used during text-mode setup to install the MMCSDNT driver
+# for installing to and booting from SD cards and eMMC on SD host
+# controllers (SDHCI) on PCI or described by ACPI.
+#
+
+[Disks]
+
+# <description> is a descriptive name for a disk, used when
+#   prompting for the disk
+# <tagfile> is a file whose presence allows setup to recognize
+#   that the disk is inserted.
+# <directory> is where the files are located on the disk.
+
+d1 = "MMCSDNT SD/MMC Driver Disk", \disk1, \
+
+
+[Defaults]
+
+# This section lists the default selection for the 'scsi' component.
+
+scsi = MMCSDNT
+
+
+[scsi]
+
+# <id> is the unique string for the option
+# <description> is a text string, presented to the user in a menu
+# <key_name> gives the name of the key to be created for the component in
+#   HKEY_LOCAL_MACHINE\ControlSet001\Services
+
+MMCSDNT = "MMCSDNT SD/MMC/eMMC Storage Controller (ages2001)", MMCSDNT
+
+
+[Files.scsi.MMCSDNT]
+
+# <file_type> is one of driver, port, class, dll, hal, inf, or detect.
+# <source_disk> identifies where the file is to be copied from, and must
+#   match an entry in the [Disks] section.
+# <filename> is the name of the file.
+
+driver = d1, MMCSDNT.sys, MMCSDNT
+
+
+[Config.scsi.MMCSDNT]
+
+# This section specifies values to be set in the registry for
+# this component option. <key_name> is relative to the services node
+# for this device; empty means the services node itself.
+
+value = "", Tag, REG_DWORD, 41
+value = "", Type, REG_DWORD, 1
+value = "", Start, REG_DWORD, 0
+value = "", Group, REG_SZ, "SCSI Miniport"
+value = "", ErrorControl, REG_DWORD, 1
