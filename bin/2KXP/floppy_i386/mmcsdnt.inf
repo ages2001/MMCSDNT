@@ -8,10 +8,11 @@ Signature="$Windows NT$"
 Class=SCSIAdapter
 ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=10/12/2026,1.0.0.0
+DriverVer=10/19/2026,1.1.0.0
 
 [DestinationDirs]
 DefaultDestDir = 12  ; DIRID_DRIVERS
+Mmc_PageFiles = 11  ; DIRID_SYSTEM (Device Manager page)
 
 ;-------------------------------------------------------------------------------
 ;                    Source disks
@@ -28,12 +29,15 @@ DefaultDestDir = 12  ; DIRID_DRIVERS
 
 [SourceDisksFiles]
 MMCSDNT.sys=1
+mmcsdpp.dll=1
 
 [SourceDisksFiles.x86]
 MMCSDNT.sys=1
+mmcsdpp.dll=1
 
 [SourceDisksFiles.amd64]
 MMCSDNT.sys=1
+mmcsdpp.dll=1
 
 ;-------------------------------------------------------------------------------
 ;                    Models
@@ -109,8 +113,8 @@ MMCSDNT.sys=1
 ; buffer of a longer one).
 
 [Mmc_Inst]
-CopyFiles = Mmc_CopyFiles
-AddReg    = Mmc_Cdd_AddReg
+CopyFiles = Mmc_CopyFiles, Mmc_PageFiles
+AddReg    = Mmc_Cdd_AddReg, Mmc_PageReg
 
 [Mmc_Inst.Services]
 AddService = MMCSDNT, %SPSVCINST_ASSOCSERVICE%, Mmc_Service_Inst, Miniport_EventLog_Inst
@@ -131,6 +135,12 @@ HKR,"Parameters\PnpInterface","15",%REG_DWORD%,1
 
 [Mmc_CopyFiles]
 MMCSDNT.sys
+
+[Mmc_PageFiles]
+mmcsdpp.dll
+
+[Mmc_PageReg]
+HKR,,EnumPropPages32,,"mmcsdpp.dll,PortPageProvider"
 
 ; A controller that appears later (other slot, new board) starts with
 ; MMCSDNT at boot as well

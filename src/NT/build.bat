@@ -20,7 +20,7 @@ if errorlevel 1 goto error
 rc -r -fommcsdnt.res ..\mmcsdnt.rc
 if errorlevel 1 goto error
 
-link -nologo -debug -debugtype:both -subsystem:native,3.50 -entry:DriverEntry@8 -driver -base:0x10000 -align:0x200 -out:mmcsdnt.sys mmcmain.obj mmccmd.obj mmcsatl.obj mmcacpi.obj scsiport.lib ntoskrnl.lib mmcsdnt.res
+link -nologo -debug -debugtype:both -subsystem:native,3.50 -entry:DriverEntry@8 -driver -base:0x10000 -align:0x200 -out:mmcsdnt.sys mmcmain.obj mmccmd.obj mmcsatl.obj mmcacpi.obj scsiport.lib ntoskrnl.lib hal.lib mmcsdnt.res
 if errorlevel 1 goto error
 
 echo mmcsdnt.sys built.

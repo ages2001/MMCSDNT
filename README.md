@@ -4,9 +4,9 @@
 
 | | |
 |---|---|
-| **Version** | 1.0.0.0 |
+| **Version** | 1.1.0.0 |
 | **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 |
-| **Hardware** | SD host controllers (SDHCI 1.00–3.00) on PCI (class code `08-05`) or described only by ACPI (Intel Bay Trail, Cherry Trail, Braswell, Apollo Lake, AMD and others); up to 6 slots per controller, 8 controllers |
+| **Hardware** | SD host controllers (SDHCI 1.00–3.00) on PCI (class code `08-05`) or described only by ACPI (Intel Bay Trail, Cherry Trail, Braswell, Apollo Lake, AMD and others); up to 6 slots per controller, 32 controllers |
 | **Cards** | SD, SDHC and SDXC (up to UHS-I SDR104), MMC and eMMC (up to HS200, HS400 on request) |
 | **Binaries** | `mmcsd9x.mpd` (Windows 9x/Me) · `mmcsdnt.sys` (NT 3.1–4.0) · `mmcsdnt.sys` (2000/XP/2003, x86 and x64) |
 
@@ -18,8 +18,10 @@
 - **Hosts only ACPI describes** (SoC tablets and laptops): found through their ACPI device nodes on 2000/XP, and by reading the ACPI tables on NT 3.1–4.0 and 9x
 - **eMMC care**: the cache, power-off notification and sleep at shutdown, device life time estimates in LOG SENSE, discard for UNMAP; eMMC 5.1 command queuing on request
 - **TRIM** as eMMC discard/trim, SD discard or erase, plus `tools\trimnt.exe` to discard the free space of a volume on systems that never send TRIM
+- **Single slots can be turned off** with `OFF=`, on every host or on one PCI host only
 - **One source tree** for all targets; the differences are a handful of `#ifdef`s
 
+- **Slots tab in Device Manager** (2000/XP/x64): check boxes to turn single slots off, without editing the registry
 ## Quick start
 
 | System | Files | How |
@@ -49,7 +51,7 @@ None of these systems knows SD host controllers at all. Windows XP got an SD bus
   - Any **PCI SD host controller** with class code `08-05` and programming interface `00` (SDHCI, no DMA) or `01` (SDHCI with DMA): Intel, Ricoh, O2Micro, Realtek, JMicron, TI, AMD and others in standard mode
   - **Several slots per PCI function**: one SDHCI register block per BAR, as the slot information register (config space 40h) gives it, up to 6 slots; every slot is one SCSI target
   - **Host controllers only ACPI describes** (SoC hosts such as Intel Bay Trail/Cherry Trail/Braswell, Apollo Lake and AMD): on 2000/XP through their ACPI device nodes (`ACPI\PNP0D40`, `ACPI\80860F14`, `ACPI\80860F16`, `ACPI\INT33BB`, `ACPI\INT3436`, `ACPI\80865ACA`, `ACPI\80865ACC`, `ACPI\80865AD0`, `ACPI\AMDI0040`); on NT 3.1–4.0 and 9x the driver finds them in the ACPI tables itself (see [In-driver ACPI](#in-driver-acpi))
-  - Up to 8 host controllers per system (build-time, see [Build-time limits](#build-time-limits)), PCI and ACPI mixed
+  - Up to 32 host controllers per system (build-time, see [Build-time limits](#build-time-limits)), PCI and ACPI mixed
   - SDHCI specification versions 1.00, 2.00 and 3.00; the clock divider of each (power-of-two 8-bit divider, 10-bit divided clock mode); 3.3 V signalling, and 1.8 V signalling for the UHS-I and HS200/HS400 modes on 3.00 hosts that offer them
   - **64-bit ADMA2** (2000/XP/x64) on SDHCI 3.00 hosts with the 64-bit system bus capability: buffers above 4 GB go to the host directly (96-bit descriptors)
   - **eMMC command queuing engine** (CQHCI, eMMC 5.1 hosts; opt-in with `CQ=1`, 2000/XP/x64), see [Command queuing](#command-queuing)
@@ -117,6 +119,7 @@ None of these systems knows SD host controllers at all. Windows XP got an SD bus
 | `src\mmcsatl.c` | SCSI-to-SD/MMC translation, sense data, MODE SENSE/SELECT, the IOCTLs |
 | `src\mmcacpi.c` | NT 3.1–4.0 and 9x: the ACPI table walk that finds SD host controllers (see [In-driver ACPI](#in-driver-acpi)) |
 | `src\NT`, `src\2KXP`, `src\9X` | Build files per target |
+| `tools\portpage.c`, `tools\mkpp.sh` | The Device Manager page `mmcsdpp.dll` for 2000/XP/x64 (see [Device Manager page](#device-manager-page)); the same source builds the page of AHCINT, IDENT, NVMENT and MMCSDNT |
 | `bin\` | Prebuilt binaries and install files |
 
 ## Feature matrix by target
@@ -160,6 +163,7 @@ None of these systems knows SD host controllers at all. Windows XP got an SD bus
 - A host whose 64-bit memory BAR the firmware placed above 4 GB is not used (the BIOS/CSM boot path of these systems leaves BARs below 4 GB)
 - Windows 9x itself does not run with more than about 1 GB without `MaxPhysPage` in `SYSTEM.INI` (and `MaxFileCache` for the cache); with that set, the driver runs with 4 GB installed
 - SDSC cards (byte addressing) are limited to 4 GB, which no SDSC card exceeds; SDHC/SDXC/eMMC to 2 TB
+- A card of exactly 2 TB (the SDXC maximum) does not fit READ CAPACITY(10): Windows 9x, NT 3.1–4.0, 2000 and XP x86 see it one sector smaller; see [Cards of 2 TB](#cards-of-2-tb)
 - 9X and NT builds do not fill auto-sense; the OS-era class drivers issue their own REQUEST SENSE
 - Windows 95 RTM: see the [SCSIPORT.PDR note](#windows-95--98--me) below
 - Tested in QEMU (SD card and eMMC models, PCI and ACPI hosts; see `TESTS.TXT`), not yet on real SD hosts; reports from real hardware are welcome
@@ -245,6 +249,10 @@ Output: `mmcsdnt.sys` under the amd64 output directory (`objfre_wnet_amd64\amd64
 
 > The 2000/XP and x64 builds should first be verified in the **checked** build environment before being rebuilt and shipped from the **free** build environment.
 
+#### Device Manager page (2000/XP/x64)
+
+`tools\mkpp.sh` builds `mmcsdpp.dll` (and the pages of the sibling drivers) from `tools\portpage.c` with MinGW-w64, x86 into `pp\i386` and x64 into `pp\amd64`. The DLL uses no C runtime: it imports only `kernel32`, `user32`, `advapi32`, `setupapi` and `comctl32` functions that Windows 2000 has.
+
 ## Installation
 
 ### Installation Media
@@ -298,6 +306,8 @@ The F6 disks carry a flat copy of `mmcsdnt.inf`: text-mode setup copies the driv
 | `MMCSD_ACPI_HOST` (9x only) | No PnP id: the manually installed device through which Windows 95 loads the driver for a host only ACPI describes |
 
 The class code `08-05` with programming interface `02` (vendor-specific) is not listed: such controllers do not follow the SDHCI layout. No Windows in this range brings a driver for any of these ids, so there is nothing to outrank. The 2000/XP INF also writes critical device entries (`pci#cc_080500`, `pci#cc_080501` and the ACPI ids) so that a host that appears later (another slot, a new board) starts with MMCSDNT at boot.
+
+Every `bin\2KXP` folder also holds `mmcsdpp.dll`, the [Device Manager page](#device-manager-page): the x86 build in `2KXP\`, `i386\` and `floppy_i386\`, the x64 build in `amd64\` and `floppy_amd64\`. `mmcsdnt.inf` copies it into `System32` and registers it (`EnumPropPages32`); `txtsetup.oem` lists it as a `dll` so that it is on the F6 disk's way into `OemDir` as well. Without it the driver works as before, only the tab is missing.
 
 ### Installing
 
@@ -366,10 +376,24 @@ On the NT family the driver reads the ScsiPort argument string, the `REG_SZ` val
 | `CQ=1` | 2000/XP/x64: eMMC command queuing through the host's CQHCI engine at offset 200h from the SDHCI registers (Intel); `CQ=xxx` gives another offset (hexadecimal). Needs an interrupt |
 | `TRIM=0` | No UNMAP (and no TRIM mode): VPD B2h and READ CAPACITY(16) report no logical block provisioning |
 | `DMA64=0` | 2000/XP/x64: no 64-bit ADMA2; buffers above 4 GB go through ScsiPort's double buffering |
+| `OFF=list` | Slots the driver leaves alone, separated by commas: `OFF=1` turns off slot 1 (the second slot, target 1) of every host; a PCI location `bus.device.function:` in front (decimal, as Device Manager shows it) limits an item to one PCI host: `OFF=0.18.0:0`. A slot turned off gets no card initialization, its interrupts are disabled and it presents no disk; the other slots keep their target IDs |
+| `RC16=1` / `RC16=0` | READ CAPACITY(10) reports `FFFFFFFFh` for a card of 2 TB (`RC16=1`, for a class driver or filter that then reads READ CAPACITY(16)), or `FFFFFFFEh` (`RC16=0`); the default depends on the Windows version, see [Cards of 2 TB](#cards-of-2-tb) |
 
 Several values are separated by spaces or semicolons.
 
 On Windows 95/98/Me `SCSIPORT.PDR` passes the string value `AdapterSettings` of the controller's driver key as the argument string. The key is `HKLM\System\CurrentControlSet\Services\Class\SCSIAdapter\000n` (the one whose `PortDriver` is `MMCSD9X.MPD`); add `"AdapterSettings"="IRQ=1"` there, for example with a `.reg` file, and restart.
+
+### Device Manager page
+
+On Windows 2000, XP and Server 2003 (x86 and x64) the controller's properties in Device Manager have a **Slots** tab (`mmcsdpp.dll`):
+
+- The list shows the slots of the host with the card in each (type and size, or `(no card)`); a slot turned off at boot is listed as `(turned off)`.
+- Clearing a check box turns that slot off: the page writes an `OFF=` item with the controller's PCI location (`bus.device.function:item`) into `DriverParameters`; checking it again removes the item. An `OFF=` item without a location (for every controller) that this controller should no longer follow is replaced by items for each of the other MMCSDNT controllers, so they keep it. A host found only through ACPI has no PCI location, so the page writes its items without one; they then apply to every MMCSDNT host.
+- The box under the list shows the whole `DriverParameters` string, for all controllers; it can be edited directly (other values, items the list does not show), and the check boxes follow it.
+- **OK** or **Apply** stores the string. Device Manager then restarts the controller, which takes effect at once for a controller without the system disk, page file or hibernation file, or asks for a restart of the computer.
+- Writing the value needs administrator rights (it is under `HKLM`).
+
+NT 3.1–4.0 have no Device Manager: there `OFF=` goes into the registry by hand, as above. On Windows 9x/Me it goes into `AdapterSettings`.
 
 ### Build-time limits
 
@@ -377,7 +401,7 @@ The limits are compile-time constants in `src\mmcsd.h`:
 
 ```c
 #define MMC_MAX_SLOTS                   6           /* per PCI function (SDHCI) */
-#define MMC_MAX_CONTROLLERS             8
+#define MMC_MAX_CONTROLLERS             32
 #define MMC_MAX_TRANSFER                0x20000     /* 128 KB */
 #define MMC_MAX_PHYS_BREAKS             32
 #define MMC_ADMA_ENTRIES                64          /* 8 or 12 bytes each, 1 KB per slot */
@@ -457,7 +481,7 @@ For each slot with a card present (an embedded slot is always treated as populat
 
 | Signature | ControlCode | Function |
 |---|---|---|
-| `"MMCSDNT "` | `1` GET_INFO | Returns `MMC_IOCTL_INFO`: driver version (`01000000h`), flags (bit 0 interrupt path active, bit 1 powered down, bit 2 ACPI host, bit 3 TRIM mode, bit 4 64-bit ADMA2), slot count, PCI vendor/device (0 for an ACPI host), physical address of slot 0, IRQ, interrupt count; per slot the card type (none, SDSC, SDHC/SDXC, MMC, MMC/eMMC sector), bus width, transfer method (PIO/SDMA/ADMA2/ADMA2 64-bit), high speed, write protect, cache on, SDHCI version, DMA error count, clock, sector count, CID, CSD, OCR, host capabilities, the retry count, EXT_CSD revision, pre-EOL and life time estimates, bus timing (legacy, HS, SDR50, SDR104, DDR50, HS200, DDR52, SDR25, HS400), unmap method (erase, trim, discard), 1.8 V signalling, power-off notification, command queuing state (bit 0 engine found, bit 1 in use, bit 2 given up), depth and the most tasks seen in flight at once |
+| `"MMCSDNT "` | `1` GET_INFO | Returns `MMC_IOCTL_INFO`: driver version (`01000100h`), flags (bit 0 interrupt path active, bit 1 powered down, bit 2 ACPI host, bit 3 TRIM mode, bit 4 64-bit ADMA2), slot count, PCI vendor/device (0 for an ACPI host), physical address of slot 0, IRQ, interrupt count; per slot the card type (none, SDSC, SDHC/SDXC, MMC, MMC/eMMC sector), bus width, transfer method (PIO/SDMA/ADMA2/ADMA2 64-bit), high speed, write protect, cache on, SDHCI version, DMA error count, clock, sector count, CID, CSD, OCR, host capabilities, the retry count, EXT_CSD revision, pre-EOL and life time estimates, bus timing (legacy, HS, SDR50, SDR104, DDR50, HS200, DDR52, SDR25, HS400), unmap method (erase, trim, discard), 1.8 V signalling, power-off notification, command queuing state (bit 0 engine found, bit 1 in use, bit 2 given up), depth and the most tasks seen in flight at once |
 | `"MMCSDNT "` | `20h` TRIM_MODE_ON | A 4 KB pattern follows the header: from now on a write whose data is that pattern repeated is not written but unmapped (see [TRIM mode](#trim-mode)) |
 | `"MMCSDNT "` | `21h` TRIM_MODE_OFF | Back to normal writes |
 | `"MMCSDNT "` | `10h` POWER_DOWN | Flush, deselect, clock and bus power off on every slot. GET_INFO does not wake the controller; any other request does |
@@ -509,6 +533,11 @@ The NT build handles NT 3.1 at run time, so the same `mmcsdnt.sys` runs on NT 3.
 ### Windows NT 4.0 (and 3.50/3.51) specifics
 
 - **Two passes:** `DriverEntry` calls `ScsiPortInitialize` for `PCIBus` (the PCI hosts; each adapter asks to be called again for the next one) and again for `Isa` (the hosts only ACPI describes, or `BASE=`). Hosts are recorded by register address so that no host is taken twice.
+- **Interrupt check:** before the interrupt is reported to ScsiPort, the driver asks the HAL for a vector (`HalGetInterruptVector`, as ScsiPort will). An MPS HAL (`halmps.dll`) translates PCI interrupts through the MP table, and a modern BIOS often writes no entry there for devices behind a PCI-PCI bridge; the HAL then returns no vector, ScsiPort cannot connect the interrupt and fails the whole adapter (`0x7B` with the system disk on it; AHCINT GitHub issue #2). The driver then reports no interrupt and runs the host with Fast Polling. `IRQ=0` does the same unconditionally.
+
+### Cards of 2 TB
+
+A card whose last block is `FFFFFFFFh` (an SDXC card of the full 2 TB) does not fit READ CAPACITY(10). The SCSI answer is `FFFFFFFFh`, which tells the class driver to read READ CAPACITY(16). The disk class drivers of Server 2003 SP1 and XP x64 (and later) do; those of NT 3.1–4.0, Windows 9x, 2000 and XP x86 do not: they add one to the value in 32 bits and see a disk of 0 bytes. The driver therefore answers `FFFFFFFEh` where the class driver does not know READ CAPACITY(16), and those systems use the card without its last block. The choice is made once at load time: the NT and 9x builds always clip; the 2000/XP x86 build asks `PsGetVersion` (Server 2003 with a service pack, or later, reads READ CAPACITY(16)); the x64 build never clips. `RC16=1` / `RC16=0` override it. The same rule is used by AHCINT, IDENT and NVMENT.
 
 ### Windows 2000/XP/x64 specifics
 
@@ -540,6 +569,16 @@ A Fast Polling read or write is polled until the SRB's `TimeOutValue` minus one 
 - **Device extension** – one `HW_DEVICE_EXTENSION` per adapter with six `MMC_SLOT`s
 
 ## Version history
+
+### 1.1.0.0 — 2026-10-19
+
+- Device Manager page (**Slots** tab, `mmcsdpp.dll`) for 2000/XP/x64: slots turned off with check boxes instead of `OFF=` typed into the registry; installed by `mmcsdnt.inf` and the F6 disks.
+- `OFF=` turns off single slots, optionally on one PCI host only (by its PCI location); a slot turned off gets no card initialization and no interrupts.
+- Up to 32 host controllers (8 before).
+- NT 3.50–4.0: an interrupt the HAL cannot translate (MPS HAL without an MP table entry for the host) no longer fails the adapter; the host runs with Fast Polling (as AHCINT, GitHub issue #2).
+- Cards of 2 TB: READ CAPACITY(10) reported `FFFFFFFFh`, which the class drivers of NT 3.1–4.0, 9x, 2000 and XP x86 turned into a disk of 0 bytes; they now get `FFFFFFFEh`. XP x64 and Server 2003 SP1 and later still read the full size with READ CAPACITY(16). `RC16=0/1` overrides.
+- A host whose registers read all ones (powered off or removed) is no longer set up again: requests fail at once instead of running into the timeouts of card initialization, and flush and shutdown requests complete without commands.
+- Shutdown and restart checked on Windows XP x64 after a hang at shutdown was reported there with AHCINT; the x64 build already used ScsiPort's register functions, so the change made to AHCINT and NVMENT was not needed here (see `TESTS.TXT`).
 
 ### 1.0.0.0 — 2026-10-12
 

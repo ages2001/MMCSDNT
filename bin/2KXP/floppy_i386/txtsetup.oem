@@ -63,6 +63,7 @@ id = "ACPI\AMDI0040", "MMCSDNT"
 
 driver = d1, MMCSDNT.sys, MMCSDNT
 inf    = d1, MMCSDNT.inf
+dll    = d1, mmcsdpp.dll
 
 
 [Config.scsi.MMCSDNT]

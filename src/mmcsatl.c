@@ -351,13 +351,21 @@ MmcHandleReportLuns(IN PSCSI_REQUEST_BLOCK Srb)
     MmcGood(Srb);
 }
 
+/* READ CAPACITY(10) for 2 TB and more (last LBA FFFFFFFFh or beyond):
+   FFFFFFFFh sends a class driver that knows READ CAPACITY(16) there.
+   One that does not (NT 3.x/4.0, 9x, 2000, XP x86) adds one to it in 32
+   bits and sees a card of 0 bytes; it gets FFFFFFFEh, the most it can
+   address with READ(10), and sees the first 2 TB. */
 static VOID
-MmcHandleReadCapacity10(IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb)
+MmcHandleReadCapacity10(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb)
 {
     UCHAR data[8];
     MMC_LBA last = MmcLastLba(Slot);
 
-    MmcPutBigEndian32(&data[0], (last.High != 0) ? 0xFFFFFFFF : last.Low);
+    if (last.High != 0 || last.Low == 0xFFFFFFFF) {
+        last.Low = HwInit->Capacity16 ? 0xFFFFFFFF : 0xFFFFFFFE;
+    }
+    MmcPutBigEndian32(&data[0], last.Low);
     MmcPutBigEndian32(&data[4], MMC_BLOCK_SIZE);
     MmcCopyToSrb(Srb, data, sizeof(data));
     MmcGood(Srb);
@@ -828,7 +836,7 @@ MmcSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         MmcStartStop(HwInit, slot, Srb);
         return;
     case SCSIOP_READ_CAPACITY:
-        MmcHandleReadCapacity10(slot, Srb);
+        MmcHandleReadCapacity10(HwInit, slot, Srb);
         return;
     case MMC_SCSIOP_SERVICE_ACTION_IN16:
         if ((cdb[1] & 0x1F) == MMC_SA_READ_CAPACITY16) {

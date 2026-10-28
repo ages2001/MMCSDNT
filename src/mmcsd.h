@@ -57,7 +57,7 @@
 #define MMC_DRIVER_NAME         "MMCSDNT"
 #endif
 
-#define MMC_DRIVER_VERSION      0x01000000  /* 1.0.0.0 */
+#define MMC_DRIVER_VERSION      0x01010000  /* 1.1.0.0 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -115,7 +115,7 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 
 #define MMC_PAGE_SIZE                   4096
 #define MMC_MAX_SLOTS                   6           /* per PCI function (SDHCI) */
-#define MMC_MAX_CONTROLLERS             8
+#define MMC_MAX_CONTROLLERS             32
 #define MMC_MAX_TRANSFER                0x20000     /* 128 KB */
 #define MMC_MAX_PHYS_BREAKS             32
 #define MMC_BLOCK_SIZE                  512
@@ -783,6 +783,7 @@ typedef struct _HW_DEVICE_EXTENSION {
     BOOLEAN                 Hs200Allowed;   /* HS200=0 */
     BOOLEAN                 DdrAllowed;     /* DDR=0 */
     BOOLEAN                 UnmapAllowed;   /* TRIM=0: UNMAP refused */
+    BOOLEAN                 Capacity16;     /* class driver follows up with READ CAPACITY(16) */
     BOOLEAN                 Hs400Allowed;   /* HS400=1 */
     BOOLEAN                 CqAllowed;      /* CQ=1 or CQ=<offset> */
     ULONG                   CqOffset;

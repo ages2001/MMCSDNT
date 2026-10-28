@@ -4,8 +4,8 @@
 
 #include <winver.h>
 
-#define MMC_VER_NUM              1,0,0,0
-#define MMC_VER_STR              "1.0.0.0"
+#define MMC_VER_NUM              1,1,0,0
+#define MMC_VER_STR              "1.1.0.0"
 
 #ifdef MMC_W9X
 #define MMC_FILE_STR             "mmcsd9x.mpd"

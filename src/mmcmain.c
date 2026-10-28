@@ -23,6 +23,14 @@ SCSI_ADAPTER_CONTROL_STATUS MmcAdapterControl(IN PVOID DeviceExtension,
 /* Crash dump / hibernation copy of the driver (no driver object):
    polled, no registry access */
 static BOOLEAN g_MmcDumpMode;
+/* The disk class driver reads READ CAPACITY(16) when READ CAPACITY(10)
+   reports FFFFFFFFh: Server 2003 SP1 and later, XP x64 */
+static BOOLEAN g_MmcCapacity16;
+#if defined(MMC_NT4) && !defined(MMC_W9X)
+/* hal.dll, every NT version; KIRQL and KAFFINITY as UCHAR and ULONG */
+ULONG __stdcall HalGetInterruptVector(INTERFACE_TYPE InterfaceType, ULONG BusNumber, ULONG BusInterruptLevel,
+                                      ULONG BusInterruptVector, PUCHAR Irql, PULONG Affinity);
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Windows 9x: VMM services                                            */
@@ -642,6 +650,8 @@ LONG __stdcall ZwCreateKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAt
 LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
                              PVOID Data, ULONG DataSize);
 LONG __stdcall ZwClose(PVOID Handle);
+BOOLEAN __stdcall PsGetVersion(PULONG MajorVersion, PULONG MinorVersion, PULONG BuildNumber,
+                               PMMC_UNICODE_STRING CsdVersion);
 
 #define MMC_OBJ_CASE_INSENSITIVE        0x00000040
 #define MMC_OBJ_KERNEL_HANDLE           0x00000200
@@ -737,6 +747,24 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     g_MmcDumpMode = (BOOLEAN)(DriverObject == NULL);
     MMC_DBG((MMC_PFX "DriverEntry%s\n", g_MmcDumpMode ? " (dump)" : ""));
 
+#if !defined(MMC_NT4)
+#if defined(_AMD64_)
+    g_MmcCapacity16 = TRUE;
+#else
+    {
+        ULONG major = 0, minor = 0, build = 0;
+        MMC_UNICODE_STRING csd;
+        csd.Length = 0;
+        csd.MaximumLength = 0;
+        csd.Buffer = NULL;
+        PsGetVersion(&major, &minor, &build, &csd);
+        g_MmcCapacity16 = (BOOLEAN)(major > 5 || (major == 5 && minor >= 2 && (build > 3790 || csd.Length != 0)));
+        MMC_DBG((MMC_PFX "DriverEntry: Windows %lu.%lu.%lu%s\n", major, minor, build,
+                 g_MmcCapacity16 ? ", READ CAPACITY(16) used" : ""));
+    }
+#endif
+#endif
+
     ZeroMemoryBytes(&initData, sizeof(HW_INITIALIZATION_DATA));
 #ifdef MMC_NT31_COMPAT
     initData.HwInitializationDataSize = MMC_HWINIT_SIZE_NT35;
@@ -821,6 +849,64 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 /* ------------------------------------------------------------------ */
 /* HwFindAdapter                                                       */
 /* ------------------------------------------------------------------ */
+
+static PCHAR
+MmcParseDecimal(IN PCHAR P, OUT PULONG Value)
+{
+    ULONG v = 0;
+    PCHAR start = P;
+
+    while (*P >= '0' && *P <= '9') v = v * 10 + (ULONG)(*P++ - '0');
+    *Value = v;
+    return (P == start) ? NULL : P;
+}
+
+/* OFF=item[,item...]: slots the driver leaves alone. item =
+   [bus.device.function:]slot, all decimal, slot 0 the first of the host;
+   with the PCI location (as Device Manager shows it) the item applies to
+   that host only, without it to every host. */
+static BOOLEAN
+MmcSlotOff(IN PCHAR Args, IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Slot)
+{
+    ULONG i, j, n, v[4], count, colon;
+    PCHAR p;
+    CHAR a;
+    PCI_SLOT_NUMBER slot;
+
+    slot.u.AsULONG = HwInit->PciSlot;
+    for (i = 0; Args != NULL && Args[i] != 0; i++) {
+        static const CHAR key[] = "OFF=";
+        if (i > 0 && ((Args[i - 1] >= 'A' && Args[i - 1] <= 'Z') || (Args[i - 1] >= 'a' && Args[i - 1] <= 'z'))) continue;
+        for (j = 0; key[j] != 0; j++) {
+            a = Args[i + j];
+            if (a >= 'a' && a <= 'z') a = (CHAR)(a - 'a' + 'A');
+            if (a != key[j]) break;
+        }
+        if (key[j] != 0) continue;
+        p = &Args[i + j];
+        for (;;) {
+            count = 0;
+            colon = 0;
+            while (count < 4) {
+                p = MmcParseDecimal(p, &n);
+                if (p == NULL) break;
+                v[count++] = n;
+                if (*p == ':' && count == 3 && colon == 0) { colon = 3; p++; continue; }
+                if (*p == '.') { p++; continue; }
+                break;
+            }
+            if (p == NULL) break;
+            if (colon != 0 && (!HwInit->HasPci || v[0] != HwInit->PciBus || v[1] != slot.u.bits.DeviceNumber ||
+                               v[2] != slot.u.bits.FunctionNumber)) {
+                count = 0;          /* another host */
+            }
+            if (count == colon + 1 && v[colon] == Slot) return TRUE;
+            if (*p != ',') break;
+            p++;
+        }
+    }
+    return FALSE;
+}
 
 /* "KEY" in the argument string, at the start of a word (HS=0 is not found
    in UHS=0); Value: the hexadecimal number after it */
@@ -911,6 +997,9 @@ MmcFindAdapter(
     hwInit->Hs200Allowed = (BOOLEAN)!MmcArg(ArgumentString, "HS200=0", NULL);
     hwInit->DdrAllowed = (BOOLEAN)!MmcArg(ArgumentString, "DDR=0", NULL);
     hwInit->UnmapAllowed = (BOOLEAN)!MmcArg(ArgumentString, "TRIM=0", NULL);
+    hwInit->Capacity16 = g_MmcCapacity16;
+    if (MmcArg(ArgumentString, "RC16=1", NULL)) hwInit->Capacity16 = TRUE;
+    if (MmcArg(ArgumentString, "RC16=0", NULL)) hwInit->Capacity16 = FALSE;
     hwInit->Hs400Allowed = (BOOLEAN)(MmcArg(ArgumentString, "HS400=1", NULL) && hwInit->Hs200Allowed);
 #if MMC_HAS_CQ
     /* CQ=1: the engine at the Intel offset 200h; CQ=<hex>: at that offset */
@@ -1059,6 +1148,25 @@ MmcFindAdapter(
         ConfigInfo->BusInterruptLevel = 0;
         ConfigInfo->BusInterruptVector = 0;
     }
+#if defined(MMC_NT4) && !defined(MMC_W9X)
+    /* The HAL must have a vector for the line: an MPS HAL whose MP table
+       has no entry for the host's interrupt gives none, and ScsiPort would
+       then fail the adapter (0x7B with the system disk on it). Fast
+       Polling needs no interrupt. */
+    if (ConfigInfo->BusInterruptLevel != 0 || ConfigInfo->BusInterruptVector != 0) {
+        UCHAR irql = 0;
+        ULONG affinity = 0;
+        ULONG vector = HalGetInterruptVector(ConfigInfo->AdapterInterfaceType, ConfigInfo->SystemIoBusNumber,
+                                             ConfigInfo->BusInterruptLevel, ConfigInfo->BusInterruptVector,
+                                             &irql, &affinity);
+        if (vector == 0 || affinity == 0) {
+            MMC_DBG((MMC_PFX "FindAdapter: no vector for IRQ %lu (vector %lu, affinity %lX), Fast Polling\n",
+                     ConfigInfo->BusInterruptLevel, vector, affinity));
+            ConfigInfo->BusInterruptLevel = 0;
+            ConfigInfo->BusInterruptVector = 0;
+        }
+    }
+#endif
 
     /* Map the slots */
     for (s = 0; s < count; s++) {
@@ -1098,6 +1206,13 @@ MmcFindAdapter(
         if (MMC_RD(slot, SDHCI_SLOT_INT_VERSION) == 0xFFFFFFFF) {
             MMC_DBG((MMC_PFX "FindAdapter: slot %lu at %08lX does not answer\n", s, bases[s]));
             return SP_RETURN_NOT_FOUND;
+        }
+        if (MmcSlotOff(ArgumentString, hwInit, s)) {
+            /* OFF=: no card set up, no interrupts from the slot */
+            MMC_WR(slot, SDHCI_SIGNAL_ENABLE, 0);
+            MMC_WR(slot, SDHCI_INT_ENABLE, 0);
+            MMC_DBG((MMC_PFX "FindAdapter: slot %lu turned off (OFF=)\n", s));
+            continue;
         }
         slot->Present = TRUE;
         slot->Caps = MMC_RD(slot, SDHCI_CAPABILITIES);
@@ -1211,6 +1326,19 @@ MmcShutdownAll(IN PHW_DEVICE_EXTENSION HwInit)
     }
 }
 
+/* Registers all ones: the host is powered off or gone */
+static BOOLEAN
+MmcUnreachable(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    ULONG s;
+
+    for (s = 0; s < HwInit->SlotCount; s++) {
+        PMMC_SLOT slot = &HwInit->Slots[s];
+        if (slot->Present && slot->Regs != NULL) return (BOOLEAN)(MMC_RD(slot, SDHCI_PRESENT_STATE) == 0xFFFFFFFF);
+    }
+    return FALSE;
+}
+
 BOOLEAN
 MmcStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -1219,6 +1347,18 @@ MmcStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 
     Srb->SrbStatus = SRB_STATUS_PENDING;
     if (Srb->TargetId < hwInit->SlotCount) slot = &hwInit->Slots[Srb->TargetId];
+
+    /* A host that is powered off or gone is not set up again (every wait
+       would run into its timeout): flush and shutdown succeed, the rest
+       fails */
+    if (Srb->Function != SRB_FUNCTION_IO_CONTROL && MmcUnreachable(hwInit)) {
+        MMC_DBG((MMC_PFX "Host not reachable (registers read FFFFFFFF)\n"));
+        Srb->SrbStatus = (UCHAR)((Srb->Function == SRB_FUNCTION_SHUTDOWN || Srb->Function == SRB_FUNCTION_FLUSH) ?
+                                 SRB_STATUS_SUCCESS : SRB_STATUS_NO_HBA);
+        ScsiPortNotification(RequestComplete, hwInit, Srb);
+        ScsiPortNotification(NextRequest, hwInit, NULL);
+        return TRUE;
+    }
 
 #if MMC_HAS_CQ
     /* Queued tasks run on: only a queued read or write goes to the engine;
