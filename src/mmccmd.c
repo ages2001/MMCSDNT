@@ -71,8 +71,7 @@ MmcWaitInt(IN PMMC_SLOT Slot, IN ULONG Mask, IN ULONG TimeoutMs, OUT PBOOLEAN Ti
             *TimedOut = TRUE;
             return st;
         }
-        ScsiPortStallExecution(MMC_POLL_INTERVAL_USEC);
-        elapsed += MMC_POLL_INTERVAL_USEC;
+        MMC_POLL_STEP(elapsed, 1);
     }
 }
 
@@ -505,8 +504,7 @@ MmcWaitIdle(IN PMMC_SLOT Slot, IN ULONG Mask, IN ULONG TimeoutMs)
         if (ps == 0xFFFFFFFF) return FALSE;
         if ((ps & Mask) == 0) return TRUE;
         if (elapsed >= limit) return FALSE;
-        ScsiPortStallExecution(MMC_POLL_INTERVAL_USEC);
-        elapsed += MMC_POLL_INTERVAL_USEC;
+        MMC_POLL_STEP(elapsed, 1);
     }
 }
 
@@ -754,6 +752,31 @@ MmcAfterTuning(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
     }
 }
 
+/* Tuning with fallbacks for a host whose tuning circuit does not lock at
+   the full clock: once more, then at 150 and 100 MHz (same mode, lower
+   clock). FALSE: the caller takes the next slower mode. */
+static BOOLEAN
+MmcTuneMode(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN UCHAR Command, IN ULONG Uhs, IN ULONG Khz,
+            IN UCHAR Timing)
+{
+    static const ULONG steps[4] = { 0, 0, 150000, 100000 };
+    ULONG i;
+
+    for (i = 0; i < 4; i++) {
+        if (steps[i] != 0) {
+            if (steps[i] >= Khz) continue;
+            MmcSetTiming(HwInit, Slot, Uhs, steps[i], Timing);
+            MMC_DBG((MMC_PFX "Slot %lu: tuning again at %lu kHz\n", (ULONG)Slot->Index, steps[i]));
+        }
+        if (MmcExecuteTuning(Slot, Command)) {
+            MmcAfterTuning(HwInit, Slot);
+            return TRUE;
+        }
+        MmcAfterTuning(HwInit, Slot);
+    }
+    return FALSE;
+}
+
 /* 1.8 V signalling on the host side; FALSE when the host keeps 3.3 V */
 static BOOLEAN
 MmcHostSignal18(IN PMMC_SLOT Slot)
@@ -828,10 +851,7 @@ MmcSdSelectUhs(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
         if (MmcSdSetFunction(HwInit, Slot, 0, mode) == mode) {
             MmcSetTiming(HwInit, Slot, uhs, khz, timing);
             if (!tune) return;
-            if (MmcExecuteTuning(Slot, SD_SEND_TUNING_BLOCK)) {
-                MmcAfterTuning(HwInit, Slot);
-                return;
-            }
+            if (MmcTuneMode(HwInit, Slot, SD_SEND_TUNING_BLOCK, uhs, khz, timing)) return;
         }
     }
     /* SDR25: no tuning */
@@ -875,8 +895,8 @@ MmcEmmcHs200(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN ULONG Cmd6Ms)
     if (!MmcHostSignal18(Slot)) return FALSE;
     if (MmcSwitch(HwInit, Slot, EXT_CSD_HS_TIMING, EXT_CSD_TIMING_HS200, Cmd6Ms) != MMC_OK) return FALSE;
     MmcSetTiming(HwInit, Slot, SDHCI_CTRL2_UHS_SDR104, MMC_CLOCK_HS200_KHZ, MMC_TIMING_HS200);
-    if (!MmcExecuteTuning(Slot, MMC_SEND_TUNING_BLOCK_HS200)) return FALSE;
-    MmcAfterTuning(HwInit, Slot);
+    if (!MmcTuneMode(HwInit, Slot, MMC_SEND_TUNING_BLOCK_HS200, SDHCI_CTRL2_UHS_SDR104, MMC_CLOCK_HS200_KHZ,
+                     MMC_TIMING_HS200)) return FALSE;
     /* The card answers at the new timing */
     return (BOOLEAN)(MmcSimple(HwInit, Slot, MMC_SEND_STATUS, (ULONG)Slot->Rca << 16, MMC_RSP_R1, NULL) == MMC_OK);
 }
@@ -1074,6 +1094,46 @@ MmcInitMmc(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
             Slot->Sectors.High = 0;
         }
 
+        /* Hardware partitions: boot 1/2 (eMMC 4.3), general purpose 1-4
+           once partitioning is completed (4.4) */
+        Slot->PartConfig = ext[EXT_CSD_PART_CONFIG];
+        Slot->PartSwitchMs = (ext[EXT_CSD_PART_SWITCH_TIME] != 0) ? (ULONG)ext[EXT_CSD_PART_SWITCH_TIME] * 10 : 1000;
+        if (Slot->PartSwitchMs < 100) Slot->PartSwitchMs = 100;
+        Slot->RpmbSize = ext[EXT_CSD_RPMB_SIZE_MULT];
+        Slot->RpmbState = MMC_RPMB_NONE;
+        Slot->PartCount = 0;
+        if (Slot->ExtCsdRev >= 3 && ext[EXT_CSD_BOOT_SIZE_MULT] != 0) {
+            ULONG b;
+            for (b = 0; b < 2; b++) {
+                PMMC_PART part = &Slot->Parts[Slot->PartCount++];
+                part->Access = (UCHAR)(1 + b);
+                part->Sectors = (ULONG)ext[EXT_CSD_BOOT_SIZE_MULT] * 256;
+                /* Boot code lives there: read-only unless EMMCPART=2, and
+                   whenever the card write-protects the area */
+                part->ReadOnly = (BOOLEAN)(HwInit->EmmcParts != 2 ||
+                                           (Slot->ExtCsdRev >= 6 && ((ext[EXT_CSD_BOOT_WP_STATUS] >> (2 * b)) & 3) != 0));
+            }
+        }
+        if (Slot->ExtCsdRev >= 4 && (ext[EXT_CSD_PARTITION_SETTING] & 1)) {
+            ULONG g, mult, unitKb = (ULONG)ext[EXT_CSD_HC_WP_GRP_SIZE] * hcErase * 512;
+            for (g = 0; g < 4 && Slot->PartCount < MMC_MAX_PARTS; g++) {
+                mult = (ULONG)ext[EXT_CSD_GP_SIZE_MULT + 3 * g] | ((ULONG)ext[EXT_CSD_GP_SIZE_MULT + 3 * g + 1] << 8) |
+                       ((ULONG)ext[EXT_CSD_GP_SIZE_MULT + 3 * g + 2] << 16);
+                if (mult == 0 || unitKb == 0) continue;
+                Slot->Parts[Slot->PartCount].Access = (UCHAR)(4 + g);
+                Slot->Parts[Slot->PartCount].Sectors = mult * unitKb * 2;
+                Slot->Parts[Slot->PartCount].ReadOnly = FALSE;
+                Slot->PartCount++;
+            }
+        }
+        /* Firmware or a boot loader may have left a boot partition selected:
+           the user area is the disk */
+        if ((Slot->PartConfig & 0x07) != 0) MmcSelectPartition(HwInit, Slot, 0);
+        if (Slot->PartCount != 0) {
+            MMC_DBG((MMC_PFX "Slot %lu: %lu hardware partition(s)%s\n", (ULONG)Slot->Index, (ULONG)Slot->PartCount,
+                     HwInit->EmmcParts ? "" : " (not shown without EMMCPART=)"));
+        }
+
         /* Bus width: 8 bits where the slot has them, else 4 */
         width = (UCHAR)((Slot->Caps & SDHCI_CAN_8BIT) ? 8 : 4);
         if (MmcSwitch(HwInit, Slot, EXT_CSD_BUS_WIDTH,
@@ -1110,8 +1170,8 @@ MmcInitMmc(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
                 Slot->NoHs200 = TRUE;
                 return 1;
             }
-            /* HS400 only on request (HS400=1): the strobe and delay settings
-               are vendor specific */
+            /* HS400 unless HS400=0: the EXT_CSD read back checks that data
+               moves; otherwise the card is set up again with HS200 */
             if ((cardType & EXT_CSD_CARD_TYPE_HS400_18) && HwInit->Hs400Allowed && !Slot->NoHs400 &&
                 Slot->BusWidth == 8 && !MmcEmmcHs400(HwInit, Slot, cmd6Ms)) {
                 MMC_DBG((MMC_PFX "Slot %lu: HS400 failed, set up again with HS200\n", (ULONG)Slot->Index));
@@ -1172,6 +1232,10 @@ MmcCardInitOnce(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
     Slot->EmmcCache = FALSE;
     Slot->CacheOn = FALSE;
     Slot->WantCache = wantCache;
+    Slot->PartCount = 0;
+    Slot->RpmbSize = 0;
+    Slot->RpmbState = MMC_RPMB_NONE;
+    Slot->WantAccess = 0;
     Slot->Sectors.Low = 0;
     Slot->Sectors.High = 0;
     Slot->ExtCsdRev = 0;
@@ -1267,7 +1331,14 @@ MmcCardInitOnce(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
         MMC_DBG((MMC_PFX "Slot %lu: CID not read\n", (ULONG)Slot->Index));
         return 1;
     }
+    if (HwInit->HotPlug && Slot->CidValid &&
+        (Slot->Cid[0] != req.Resp[0] || Slot->Cid[1] != req.Resp[1] ||
+         Slot->Cid[2] != req.Resp[2] || Slot->Cid[3] != req.Resp[3])) {
+        MMC_DBG((MMC_PFX "Slot %lu: another card\n", (ULONG)Slot->Index));
+        Slot->MediumChanged = TRUE;
+    }
     CopyMemoryBytes(Slot->Cid, req.Resp, sizeof(Slot->Cid));
+    Slot->CidValid = TRUE;
 
     /* Relative address: the card picks it (SD), the host assigns it (MMC) */
     if (sd) {
@@ -1400,6 +1471,11 @@ MmcReadWrite(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST
                 Slot->NeedsInit = TRUE;
                 return MMC_ERR_NO_CARD;
             }
+            /* HOTPLUG=1: a card set up again is checked first; another
+               card gets nothing meant for the one before */
+            if (Slot->MediumChanged) return MMC_ERR_CHANGED;
+            /* Set up again in the user area: back to the partition */
+            if (Slot->WantAccess != 0 && MmcSelectPartition(HwInit, Slot, Slot->WantAccess) != MMC_OK) return MMC_ERR_CARD;
         }
         if (result != MMC_OK) return result;
         p += chunk * MMC_BLOCK_SIZE;
@@ -1427,6 +1503,173 @@ MmcVerify(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN MMC_LBA Lba, IN 
         Count -= chunk;
     }
     return MMC_OK;
+}
+
+/* eMMC hardware partition for the following commands (0: user area);
+   the other bits of PARTITION_CONFIG stay as the card has them */
+ULONG
+MmcSelectPartition(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN UCHAR Access)
+{
+    ULONG result;
+    UCHAR value = (UCHAR)((Slot->PartConfig & ~0x07) | (Access & 0x07));
+
+    if ((Slot->PartConfig & 0x07) == (Access & 0x07)) return MMC_OK;
+    result = MmcSwitch(HwInit, Slot, EXT_CSD_PART_CONFIG, value, Slot->PartSwitchMs);
+    if (result == MMC_OK) Slot->PartConfig = value;
+    MMC_DBG((MMC_PFX "Slot %lu: partition %lu %s\n", (ULONG)Slot->Index, (ULONG)(Access & 0x07),
+             (result == MMC_OK) ? "selected" : "not selected"));
+    return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* RPMB                                                                */
+/* ------------------------------------------------------------------ */
+
+/* Frames of 512 bytes; the request or response type is in bytes 510-511
+   (big-endian). Authenticated writes, key programming and the device
+   configuration write go as reliable writes. */
+#define MMC_RPMB_PROGRAM_KEY            0x0001
+#define MMC_RPMB_READ_COUNTER           0x0002
+#define MMC_RPMB_WRITE                  0x0003
+#define MMC_RPMB_READ                   0x0004
+#define MMC_RPMB_RESULT                 0x0005
+#define MMC_RPMB_CONFIG_WRITE           0x0006
+#define MMC_RPMB_CONFIG_READ            0x0007
+
+static USHORT
+MmcRpmbType(IN PUCHAR Frame)
+{
+    return (USHORT)(((USHORT)Frame[510] << 8) | Frame[511]);
+}
+
+/* CMD23 with the count (and the reliable write flag), then CMD25/CMD18
+   in the RPMB partition; Buffer NULL: the scratch buffer (one frame) */
+static ULONG
+MmcRpmbFrames(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN PVOID Buffer,
+              IN ULONG Count, IN BOOLEAN IsWrite, IN BOOLEAN Reliable)
+{
+    MMC_REQUEST req;
+    ULONG result = MMC_OK, pio;
+
+    for (pio = 0; pio < 2; pio++) {
+        result = MmcSimple(HwInit, Slot, MMC_SET_BLOCK_COUNT, Count | (Reliable ? 0x80000000UL : 0), MMC_RSP_R1, NULL);
+        if (result != MMC_OK) return result;
+        ZeroMemoryBytes(&req, sizeof(req));
+        req.Command = (UCHAR)(IsWrite ? MMC_WRITE_MULTIPLE_BLOCK : MMC_READ_MULTIPLE_BLOCK);
+        req.Response = MMC_RSP_R1;
+        req.Buffer = Buffer;
+        req.BlockSize = MMC_BLOCK_SIZE;
+        req.BlockCount = Count;
+        req.IsWrite = IsWrite;
+        req.NoDma = (BOOLEAN)(pio != 0);
+        req.Srb = (Buffer != NULL) ? Srb : NULL;
+        result = MmcExecute(HwInit, Slot, &req);
+        if (result != MMC_ERR_BAD_BUFFER) break;
+    }
+    return result;
+}
+
+/* One request frame from RpmbFrame or the scratch buffer, then Count
+   response frames into Buffer (NULL: the scratch buffer, one frame) */
+static ULONG
+MmcRpmbAsk(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN PVOID Buffer,
+           IN ULONG Count)
+{
+    ULONG result = MmcRpmbFrames(HwInit, Slot, NULL, NULL, 1, TRUE, FALSE);
+    if (result != MMC_OK) return result;
+    return MmcRpmbFrames(HwInit, Slot, Srb, Buffer, Count, FALSE, FALSE);
+}
+
+static ULONG
+MmcRpmbEnter(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
+{
+    if (Slot->Outstanding != NULL) MmcDrainSlot(HwInit, Slot);
+    return MmcSelectPartition(HwInit, Slot, 3);
+}
+
+static VOID
+MmcRpmbLeave(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
+{
+    /* The user area must never be written through another partition */
+    if (MmcSelectPartition(HwInit, Slot, 0) != MMC_OK) Slot->NeedsInit = TRUE;
+}
+
+/* SECURITY PROTOCOL OUT: Count frames from the SRB's buffer. A write
+   (key, data, device configuration) is sent at once together with its
+   result read request, and the response kept for the IN that follows;
+   a read request (counter, data, configuration) is kept and sent with
+   that IN, so that nothing comes between request and response. */
+ULONG
+MmcRpmbOut(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Count)
+{
+    PUCHAR data = (PUCHAR)Srb->DataBuffer;
+    USHORT type = MmcRpmbType(data);
+    ULONG result;
+
+    switch (type) {
+    case MMC_RPMB_READ_COUNTER:
+    case MMC_RPMB_READ:
+    case MMC_RPMB_CONFIG_READ:
+        if (Count != 1) return MMC_ERR_CARD;
+        CopyMemoryBytes(Slot->RpmbFrame, data, MMC_BLOCK_SIZE);
+        Slot->RpmbState = MMC_RPMB_REQUEST;
+        return MMC_OK;
+    case MMC_RPMB_RESULT:
+        if (Count != 1) return MMC_ERR_CARD;
+        if (Slot->RpmbState == MMC_RPMB_RESPONSE) return MMC_OK;     /* already read with the write */
+        result = MmcRpmbEnter(HwInit, Slot);
+        if (result == MMC_OK) {
+            CopyMemoryBytes(Slot->Scratch, data, MMC_BLOCK_SIZE);
+            result = MmcRpmbAsk(HwInit, Slot, NULL, NULL, 1);
+        }
+        break;
+    case MMC_RPMB_PROGRAM_KEY:
+    case MMC_RPMB_WRITE:
+    case MMC_RPMB_CONFIG_WRITE:
+        result = MmcRpmbEnter(HwInit, Slot);
+        if (result == MMC_OK) result = MmcRpmbFrames(HwInit, Slot, Srb, data, Count, TRUE, TRUE);
+        if (result == MMC_OK) {
+            ZeroMemoryBytes(Slot->Scratch, MMC_BLOCK_SIZE);
+            Slot->Scratch[511] = (UCHAR)MMC_RPMB_RESULT;
+            result = MmcRpmbAsk(HwInit, Slot, NULL, NULL, 1);
+        }
+        break;
+    default:
+        return MMC_ERR_CARD;
+    }
+    Slot->RpmbState = MMC_RPMB_NONE;
+    if (result == MMC_OK) {
+        CopyMemoryBytes(Slot->RpmbFrame, Slot->Scratch, MMC_BLOCK_SIZE);
+        Slot->RpmbState = MMC_RPMB_RESPONSE;
+    }
+    MmcRpmbLeave(HwInit, Slot);
+    MMC_DBG((MMC_PFX "Slot %lu: RPMB request %04lX, %lu frame(s): %lu\n", (ULONG)Slot->Index, (ULONG)type, Count, result));
+    return result;
+}
+
+/* SECURITY PROTOCOL IN: the response kept, or the request kept sent now
+   and its Count response frames read into the SRB's buffer */
+ULONG
+MmcRpmbIn(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Count)
+{
+    ULONG result;
+
+    if (Slot->RpmbState == MMC_RPMB_RESPONSE) {
+        Slot->RpmbState = MMC_RPMB_NONE;
+        if (Count != 1) return MMC_ERR_CARD;
+        CopyMemoryBytes(Srb->DataBuffer, Slot->RpmbFrame, MMC_BLOCK_SIZE);
+        return MMC_OK;
+    }
+    if (Slot->RpmbState != MMC_RPMB_REQUEST) return MMC_ERR_SEQUENCE;
+    Slot->RpmbState = MMC_RPMB_NONE;
+    result = MmcRpmbEnter(HwInit, Slot);
+    if (result == MMC_OK) {
+        CopyMemoryBytes(Slot->Scratch, Slot->RpmbFrame, MMC_BLOCK_SIZE);
+        result = MmcRpmbAsk(HwInit, Slot, Srb, Srb->DataBuffer, Count);
+    }
+    MmcRpmbLeave(HwInit, Slot);
+    MMC_DBG((MMC_PFX "Slot %lu: RPMB response, %lu frame(s): %lu\n", (ULONG)Slot->Index, Count, result));
+    return result;
 }
 
 /* eMMC cache: flush it (SD cards: nothing to do) */
@@ -1613,16 +1856,25 @@ MmcIssueAsync(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUES
     BOOLEAN badBuffer;
 
     if (Slot->Outstanding != NULL) return SRB_STATUS_BUSY;
-    if (Slot->Xfer != MMC_XFER_ADMA2 || Count > MMC_MAX_TRANSFER / MMC_BLOCK_SIZE) return SRB_STATUS_INVALID_REQUEST;
+    if (Count > MmcMaxBlocks(HwInit, Slot) || Srb->DataBuffer == NULL) return SRB_STATUS_INVALID_REQUEST;
+    /* SDMA goes through the adapter's one bounce buffer: by interrupt only
+       where no other slot could use it meanwhile */
+    if (Slot->Xfer == MMC_XFER_SDMA && HwInit->SlotCount > 1) return SRB_STATUS_INVALID_REQUEST;
     if (!Slot->BlockAddressing && (Lba.Low >= 0x00800000 || Lba.Low + Count > 0x00800000)) return SRB_STATUS_INVALID_REQUEST;
 
     MmcFillRw(Slot, &req, Srb, Srb->DataBuffer, Lba, Count, IsWrite);
     if (!MmcWaitIdle(Slot, SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT, MMC_BUSY_TIMEOUT_MS)) return SRB_STATUS_INVALID_REQUEST;
     MMC_WR(Slot, SDHCI_INT_STATUS, 0xFFFFFFFF);
+    /* A buffer ADMA2 cannot describe goes with PIO, also by interrupt */
     mode = MmcSetupData(HwInit, Slot, &req, &dma, &badBuffer);
-    if (badBuffer || dma != MMC_XFER_ADMA2) return SRB_STATUS_INVALID_REQUEST;
 
-    MMC_WR(Slot, SDHCI_SIGNAL_ENABLE, SDHCI_INT_SIGNAL_MASK);
+    Slot->ActiveXfer = dma;
+    Slot->PioBuffer = (PUCHAR)Srb->DataBuffer;
+    Slot->PioBlocks = Count;
+    Slot->ActiveBuffer = (PUCHAR)Srb->DataBuffer;
+    Slot->ActiveBytes = Count * MMC_BLOCK_SIZE;
+    MMC_WR(Slot, SDHCI_SIGNAL_ENABLE, SDHCI_INT_SIGNAL_MASK |
+           ((dma == MMC_XFER_PIO) ? (IsWrite ? SDHCI_INT_SPACE_AVAIL : SDHCI_INT_DATA_AVAIL) : 0));
     result = MmcSendCommand(HwInit, Slot, &req, mode);
     if (result != MMC_OK || (req.Resp[0] & MMC_R1_ERRORS)) {
         MMC_WR(Slot, SDHCI_SIGNAL_ENABLE, 0);
@@ -1647,6 +1899,40 @@ MmcServiceSlot(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN BOOLEAN Fro
     if (srb == NULL) return 0;
 
     st = MMC_RD(Slot, SDHCI_INT_STATUS);
+    if (st != 0xFFFFFFFF && !(st & SDHCI_INT_ERROR)) {
+        if (Slot->ActiveXfer == MMC_XFER_PIO && Slot->PioBlocks != 0) {
+            /* PIO: every block the buffer has ready; the next one is often
+               there within microseconds and is taken without its interrupt */
+            ULONG ready = Slot->ActiveWrite ? SDHCI_INT_SPACE_AVAIL : SDHCI_INT_DATA_AVAIL;
+            ULONG moved = 0, t;
+            while (Slot->PioBlocks != 0) {
+                if (!(st & ready)) {
+                    for (t = 0; t < MMC_PIO_SPIN_USEC && !(st & (ready | SDHCI_INT_ERROR)); t++) {
+                        ScsiPortStallExecution(1);
+                        st = MMC_RD(Slot, SDHCI_INT_STATUS);
+                    }
+                    if (!(st & ready)) break;
+                }
+                MMC_WR(Slot, SDHCI_INT_STATUS, ready);
+                MmcPioBlock(Slot, Slot->PioBuffer, MMC_BLOCK_SIZE, Slot->ActiveWrite);
+                Slot->PioBuffer += MMC_BLOCK_SIZE;
+                Slot->PioBlocks--;
+                moved++;
+                st = MMC_RD(Slot, SDHCI_INT_STATUS);
+                if (st == 0xFFFFFFFF || (st & SDHCI_INT_ERROR)) break;
+            }
+            if (Slot->PioBlocks == 0) {
+                /* no more buffer interrupts wanted */
+                MMC_WR(Slot, SDHCI_SIGNAL_ENABLE, SDHCI_INT_SIGNAL_MASK);
+            }
+            if (!(st & (SDHCI_INT_DATA_END | SDHCI_INT_ERROR)) && st != 0xFFFFFFFF) return (moved != 0) ? 1 : 0;
+        } else if (Slot->ActiveXfer == MMC_XFER_SDMA && (st & SDHCI_INT_DMA_END) && !(st & SDHCI_INT_DATA_END)) {
+            /* SDMA buffer boundary: on from where the engine stopped */
+            MMC_WR(Slot, SDHCI_INT_STATUS, SDHCI_INT_DMA_END);
+            MMC_WR(Slot, SDHCI_SDMA_ADDRESS, MMC_RD(Slot, SDHCI_SDMA_ADDRESS));
+            return 1;
+        }
+    }
     if (st == 0xFFFFFFFF) {
         result = MMC_ERR_DATA;
     } else if (!(st & (SDHCI_INT_DATA_END | SDHCI_INT_ERROR))) {
@@ -1660,11 +1946,20 @@ MmcServiceSlot(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN BOOLEAN Fro
         Slot->LastIntStatus = st;
         MMC_DBG((MMC_PFX "Slot %lu: %s failed, status %08lX\n", (ULONG)Slot->Index,
                  Slot->ActiveWrite ? "write" : "read", st));
-        if (++Slot->DmaErrors >= MMC_DMA_ERROR_LIMIT) Slot->Xfer = MMC_XFER_PIO;
+        if (Slot->ActiveXfer != MMC_XFER_PIO && ++Slot->DmaErrors >= MMC_DMA_ERROR_LIMIT) Slot->Xfer = MMC_XFER_PIO;
         MmcRecover(HwInit, Slot, TRUE);
     } else {
-        MMC_WR(Slot, SDHCI_INT_STATUS, st & (SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_RESPONSE));
-        Slot->DmaErrors = 0;
+        MMC_WR(Slot, SDHCI_INT_STATUS, st & (SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_RESPONSE |
+                                             SDHCI_INT_SPACE_AVAIL | SDHCI_INT_DATA_AVAIL));
+        if (Slot->ActiveXfer == MMC_XFER_PIO && Slot->PioBlocks != 0) {
+            result = MMC_ERR_DATA;              /* ended before all blocks moved */
+            MmcRecover(HwInit, Slot, TRUE);
+        } else {
+            if (Slot->ActiveXfer == MMC_XFER_SDMA && !Slot->ActiveWrite) {
+                CopyMemoryBytes(Slot->ActiveBuffer, HwInit->SdmaBounce, Slot->ActiveBytes);
+            }
+            if (Slot->ActiveXfer != MMC_XFER_PIO) Slot->DmaErrors = 0;
+        }
     }
 
     Slot->Outstanding = NULL;
@@ -1696,8 +1991,7 @@ MmcDrainSlot(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
             MmcRecover(HwInit, Slot, TRUE);
             break;
         }
-        ScsiPortStallExecution(MMC_POLL_INTERVAL_USEC);
-        elapsed += MMC_POLL_INTERVAL_USEC;
+        MMC_POLL_STEP(elapsed, 1);
     }
 }
 

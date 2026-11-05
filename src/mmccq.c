@@ -2,8 +2,9 @@
 
 /* mmccq.c - eMMC 5.1 command queuing through the command queuing engine
    (CQHCI) of the host: up to MMC_CQ_DEPTH reads and writes are in flight
-   per card. On request only (CQ=1, or CQ=<register offset>), and only
-   with interrupts. Anything else than a queued read or write halts the
+   per card. By default on Intel PCI hosts with the engine at 200h (CQ=1
+   or CQ=<register offset> for others, CQ=0 off), and only with
+   interrupts. Anything else than a queued read or write halts the
    engine and turns command queue mode of the card off first; the next
    read or write turns both on again. An error fails the tasks in flight
    with a bus reset (the class driver retries them), turns command
@@ -217,8 +218,7 @@ MmcCqHalt(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
             MmcCqFail(HwInit, Slot, SRB_STATUS_BUS_RESET);
             return;
         }
-        ScsiPortStallExecution(MMC_POLL_INTERVAL_USEC);
-        elapsed += MMC_POLL_INTERVAL_USEC;
+        MMC_POLL_STEP(elapsed, 1);
     }
     if (!Slot->CqHalted) MmcCqEngineOff(Slot);
     if (Slot->CqCardOn) {

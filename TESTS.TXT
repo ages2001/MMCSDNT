@@ -1,5 +1,148 @@
 MMCSDNT - test results for this release (QEMU 8.2 with the QEMU 9.1 SD/eMMC models)
 
+Hibernation on Windows 2000 and XP x64 (2026-11-03)
+
+- Display: S4 needs a driver on the display adapter. Windows 2000 with
+  -vga cirrus: the in-box Cirrus Logic 5446 driver (display.inf),
+  installed through SetupAPI. XP x64 with the std VGA: the in-box
+  "Standard VGA Graphics Adapter" (display.inf, vgapnp.sys, which XP x64
+  had not picked for the device), installed the same way. No driver was
+  downloaded: the one free QEMU display driver source found
+  (roytam1/vbemp, VBE miniport for NT 3.x) is x86 only and has no power
+  management, so it would not have let S4 through either.
+- Windows 2000 (256 MB, ACPI HAL, patched QEMU with AHCI link power
+  management, NVMe HMB 8 MB and APST): system disk on AHCINT (ICH9
+  port 0), 256 MB disks on AHCI port 1 (AHCINT), on the PIIX3 primary
+  and secondary master (IDENT; the CD as secondary slave), an NVMe
+  namespace (NVMENT) and an SD card on sdhci-pci (MMCSDNT). Power
+  capabilities S3 1 S4 1, hibernation file reserved. bench.exe on the
+  five data disks, hibernate, resume, bench again, hibernate, resume,
+  bench again: all without errors; DRIVER.CAB from the CD and FC: equal
+  afterwards; IDENTIFY through \\.\PhysicalDriveN still reached each
+  disk (the SD card has none). After the second resume QEMU's log shows
+  APST on, the HMB given again (2048 pages, every descriptor checked)
+  and ALPE set on the AHCI ports; before the final power-off ALPE and
+  ADSE were cleared (full power).
+- XP x64 (512 MB, stock QEMU): system disk on IDENT (PIIX3 primary
+  master), data disks on the primary slave and secondary master
+  (IDENT), AHCI port 1 (AHCINT) and NVMe (NVMENT), the CD as secondary
+  slave. S4 1, hibernation file reserved; the same two cycles with
+  bench.exe before and after each: all without errors, then DRIVER.CAB
+  and FC equal, IDENTIFY through each \\.\PhysicalDriveN.
+- XP x64 with MMCSDNT (release build, installed with mmcsdnt.inf through
+  SetupAPI; system disk on IDENT, an SD card on sdhci-pci): the card
+  listed as PhysicalDrive1 (256 MB); bench.exe on it (32 MB), hibernate,
+  resume, the card listed again and bench.exe on it: without errors;
+  with the password on resume turned off, powered off at the end.
+- After a resume both systems lock the session; a power-off asked for by
+  a program in that locked session (ExitWindowsEx returned success) did
+  not power the machine off, it stayed at the logon screen. With the
+  password on resume turned off (powercfg /globalpowerflag off /option
+  resumepassword, XP x64) the same program powered off at once after a
+  resume. Windows behaviour, not the drivers'.
+
+RPMB, HS400 and command queuing by default (added to 1.2.0.0,
+2026-11-02)
+
+- RPMB (SECURITY PROTOCOL IN/OUT ECh): not tested; the QEMU here has no
+  eMMC model (see below). With an SD card (the runs below), SECURITY
+  PROTOCOL is not reached by Windows.
+- HS400 on by default and command queuing on by default for Intel hosts:
+  not reached with QEMU's SD card and its Red Hat (1B36:0007) host; the
+  runs below show that nothing changed for that host (no engine mapped:
+  the host is not Intel, so the default does not probe 200h).
+- Release build of this round, Windows 2000, HOTPLUG=1 image: card
+  ejected during the test program and inserted again, test program
+  afterwards without error, as before.
+
+Interrupt completion for SDMA and PIO, eMMC partitions, tuning
+fallback, registers above 4 GB (added to 1.2.0.0, 2026-11-02)
+
+Read and write commands now complete by interrupt with SDMA and PIO as
+well (ADMA2 did already); Fast Polling remains for hosts without an
+interrupt, IRQ=0, the dump instance and the commands at start-up.
+- Windows 2000, QEMU sdhci-pci (SDHCI 3.00) with a 256 MB SD card, debug
+  builds, bench.exe (reads and writes, queue depths up to 8, verify
+  passes):
+  - ADMA2 (the default): no errors.
+  - SDMA (QEMU's capabilities set to SDMA only, capareg=0x057034B4):
+    "SDMA", no errors.
+  - PIO (a build with DMA off): "PIO", no errors; the driver moves each
+    following block without waiting for its interrupt when the host has
+    it ready, as IDENT does.
+- Release build of this version, HOTPLUG=1 image (sdhci-pci with
+  sd-spec-version=3, ADMA2): card ejected during the test program and
+  inserted again: requests failed, the drive stayed without a medium,
+  test program afterwards without error.
+- eMMC hardware partitions (EMMCPART=1: boot and general purpose
+  partitions as LUN 1 and up, boot partitions read-only; EMMCPART=2:
+  boot partitions writable; RPMB is not a LUN, it is reached through
+  SECURITY PROTOCOL, see above): not tested; the QEMU build with the 9.1
+  eMMC model used for the eMMC runs below was not available for this
+  round. Off by default, and with EMMCPART the command queue stays off
+  (a partition switch needs an empty queue).
+- Tuning fallback (tuning once more, then at 150 and 100 MHz, before the
+  next slower mode): not tested (QEMU's SD card does not take UHS
+  modes).
+- Register BARs above 4 GB (64-bit BARs on 2000/XP/x64; 9x maps only
+  below 4 GB and skips such a slot): not tested (SeaBIOS places QEMU's
+  SDHCI below 4 GB).
+
+Card change, HOTPLUG=1 (added to 1.2.0.0, 2026-11-02)
+
+- Windows 2000, MMCSDNT on QEMU's sdhci-pci with a 256 MB SD card,
+  DriverParameters HOTPLUG=1; the card was ejected and
+  inserted again through the QEMU monitor (eject / change):
+  - the disk shows as removable (media type 11) "SD/MMC Card Slot 0".
+  - ejected while idle (debug build): "card removed", the drive stays without a medium
+    (0 MB); inserted again: set up at the next request, full test
+    program run without error.
+  - ejected during writes (release build): requests failed, the drive stayed without a
+    medium; inserted again: full test program run without error.
+- Found while testing: QEMU's host holds back a new card detect until
+  the card removal status bit is acknowledged; the driver now
+  acknowledges both card status bits at every check. And with the
+  card's name in INQUIRY the disk vanished on a rescan with no card
+  (other INQUIRY data, so another device for Windows); INQUIRY now
+  describes the slot when HOTPLUG=1 is set.
+- Windows NT 4.0 SP1 (system disk on IDE), MMCSDNT debug build with
+  HOTPLUG on built in, loaded through an unused miniport service (Start
+  changed offline in place), 64 MB SD card: ejected: "card removed";
+  inserted: "card inserted", set up again at the next request; logged
+  on, ntoskrnl.exe copied to D: and compared with FC: equal, and equal
+  on the host.
+- Not run on 9x (MMCSD9X could not be installed in the supplied image
+  without its setup).
+- Stays opt-in (HOTPLUG=1): it changes the disk into a removable one
+  with the slot's name.
+
+Additions to 1.2.0.0 (2026-11-02): text-mode setup registration,
+register checks, port program, GET_LOCATION
+
+- Reported: 2000/XP x86 text-mode setup with MMCSDNT integrated stopped
+  at "Setup is starting Windows" on a machine without SD/MMC hardware.
+  Not reproduced: Windows 2000 with MMCSDNT as a boot driver and no SD
+  host (with and without Parameters\PnpInterface at boot); XP x64
+  text-mode setup from a CD with MMCSDNT integrated (TXTSETUP.SIF:
+  SCSI.Load, HardwareIdsDatabase with PCI\CC_0805, ACPI\PNP0D40,
+  *PNP0D40, ACPI\AMDI0040), without an SD host, with an empty
+  sdhci-pci host, and with an extra ACPI table that adds a PNP0D40 node
+  over unused memory: Welcome screen each time. No Windows 2000 or XP
+  x86 setup CD was available here.
+- 1.2.0.0, same runs: on a bare service key DriverEntry writes only
+  PnpInterface\5 and calls ScsiPortInitialize for PCI only (debug
+  output); with the ACPI PNP0D40 node present it adds 0, 1 and 15 and
+  calls it for those bus types too. XP x64 text-mode setup with an SD
+  card (256 MB) in an sdhci-pci host lists the card as "Disk 0 on
+  mmcsdnt" in the partition list.
+- Port program mmccfg.exe: built from the same code as identcfg.exe,
+  ahcicfg.exe and nvmecfg.exe, which were checked on Windows 2000; not
+  run with an SD host here.
+- Build: MinGW-w64 GCC 13 as before; the 2000/XP x86 binary for the
+  Pentium (-march=i586, no CMOV), checked by disassembly; all binaries
+  link without libgcc (no 64-bit division helpers, whose calling
+  convention differs under -mrtd).
+
 Additions to 1.1.0.0 (2026-10-26): OFF=, MPS interrupt check, cards of
 2 TB, 32 controllers
 

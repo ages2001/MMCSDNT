@@ -142,6 +142,10 @@ MmcCompleteResult(IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Result
     case MMC_ERR_NO_CARD:
         MmcNoMedium(Slot, Srb);
         break;
+    case MMC_ERR_CHANGED:
+        Slot->MediumChanged = FALSE;
+        MmcFailWithSense(Slot, Srb, SCSI_SENSE_UNIT_ATTENTION, MMC_ASC_MEDIUM_CHANGED, 0);
+        break;
     case MMC_ERR_BAD_BUFFER:
         Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         break;
@@ -254,8 +258,10 @@ MmcHandleInquiryVpd(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_
         len = 4 + 4;
         break;
     case MMC_VPD_SERIAL_NUMBER:
-        /* Product serial number from the CID */
-        if (MmcIsSd(Slot)) {
+        /* Product serial number from the CID; HOTPLUG=1: the slot's */
+        if (MmcSlotHotPlug(HwInit, Slot)) {
+            psn = Slot->Index;
+        } else if (MmcIsSd(Slot)) {
             psn = ((ULONG)MmcCidByte(Slot, 9) << 24) | ((ULONG)MmcCidByte(Slot, 10) << 16) |
                   ((ULONG)MmcCidByte(Slot, 11) << 8) | MmcCidByte(Slot, 12);
         } else {
@@ -295,13 +301,30 @@ MmcHandleInquiry(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQ
 
     ZeroMemoryBytes(&inq, sizeof(inq));
     inq.DeviceType = DIRECT_ACCESS_DEVICE;
-    inq.RemovableMedia = 0;                     /* boot and system disk: a fixed disk */
+    /* A fixed disk: boot and system disk. HOTPLUG=1: a removable one, its
+       card may come and go */
+    inq.RemovableMedia = (UCHAR)(MmcSlotHotPlug(HwInit, Slot) ? 1 : 0);
     inq.Versions = MMC_INQUIRY_VERSION_SPC3;
     inq.ResponseDataFormat = 2;
     inq.AdditionalLength = 31;
 #if MMC_HAS_CQ
     inq.CommandQueue = (UCHAR)(Slot->CqActive ? 1 : 0);
 #endif
+
+    /* HOTPLUG=1: the slot, not the card, so that the disk stays the same
+       while cards come and go */
+    if (inq.RemovableMedia) {
+        MmcPutText(inq.VendorId, 8, "SD/MMC");
+        MmcPutText(inq.ProductId, 16, "Card Slot");
+        inq.ProductId[10] = (UCHAR)('0' + Slot->Index % 10);
+        inq.ProductRevisionLevel[0] = (UCHAR)('0' + (MMC_DRIVER_VERSION >> 24) % 10);
+        inq.ProductRevisionLevel[1] = '.';
+        inq.ProductRevisionLevel[2] = (UCHAR)('0' + ((MMC_DRIVER_VERSION >> 16) & 0xFF) % 10);
+        inq.ProductRevisionLevel[3] = ' ';
+        MmcCopyToSrb(Srb, &inq, sizeof(inq));
+        MmcGood(Srb);
+        return;
+    }
 
     for (i = 0; g_MmcVendors[i].Name != NULL; i++) {
         if (g_MmcVendors[i].Mid == mid && (g_MmcVendors[i].Sd != 0) == (sd != 0)) {
@@ -337,15 +360,50 @@ MmcHandleInquiry(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQ
 /* Other commands answered by the driver                               */
 /* ------------------------------------------------------------------ */
 
+/* SECURITY PROTOCOL IN/OUT: protocol 00h (the list of protocols) and,
+   on an eMMC with an RPMB, ECh with protocol specific 0000h/0001h: the
+   RPMB frames (512 bytes each), as UFS devices take them */
 static VOID
-MmcHandleReportLuns(IN PSCSI_REQUEST_BLOCK Srb)
+MmcHandleSecurity(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    UCHAR data[16];
+    PUCHAR cdb = Srb->Cdb;
+    BOOLEAN in = (BOOLEAN)(cdb[0] == MMC_SCSIOP_SECURITY_IN);
+    ULONG sp = ((ULONG)cdb[2] << 8) | cdb[3];
+    ULONG len = MmcBigEndian32(&cdb[6]), result;
+    UCHAR list[10];
+
+    if (cdb[4] & 0x80) len *= MMC_BLOCK_SIZE;               /* INC_512 */
+    if (in && cdb[1] == 0x00 && sp == 0) {
+        ZeroMemoryBytes(list, sizeof(list));
+        list[7] = (UCHAR)(Slot->RpmbSize != 0 ? 2 : 1);
+        list[9] = MMC_SECURITY_RPMB;
+        MmcCopyToSrb(Srb, list, (len < (ULONG)(8 + list[7])) ? len : (ULONG)(8 + list[7]));
+        MmcGood(Srb);
+        return;
+    }
+    if (cdb[1] != MMC_SECURITY_RPMB || sp > 1 || Slot->RpmbSize == 0 ||
+        len == 0 || (len % MMC_BLOCK_SIZE) != 0 || len > Srb->DataTransferLength) {
+        MmcInvalidField(Slot, Srb);
+        return;
+    }
+    result = in ? MmcRpmbIn(HwInit, Slot, Srb, len / MMC_BLOCK_SIZE) : MmcRpmbOut(HwInit, Slot, Srb, len / MMC_BLOCK_SIZE);
+    if (result == MMC_ERR_SEQUENCE) {
+        MmcFailWithSense(Slot, Srb, SCSI_SENSE_ILLEGAL_REQUEST, MMC_ASC_SEQUENCE_ERROR, 0);
+        return;
+    }
+    MmcCompleteResult(Slot, Srb, result, (BOOLEAN)!in);
+}
+
+static VOID
+MmcHandleReportLuns(IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Luns)
+{
+    UCHAR data[8 + 8 * (1 + MMC_MAX_PARTS)];
     ULONG allocLen = MmcBigEndian32(&Srb->Cdb[6]);
-    ULONG len = 16;
+    ULONG len = 8 + 8 * Luns, i;
 
     ZeroMemoryBytes(data, sizeof(data));
-    MmcPutBigEndian32(&data[0], 8);
+    MmcPutBigEndian32(&data[0], 8 * Luns);
+    for (i = 1; i < Luns; i++) data[8 + 8 * i + 1] = (UCHAR)i;
     if (len > allocLen) len = allocLen;
     MmcCopyToSrb(Srb, data, len);
     MmcGood(Srb);
@@ -770,6 +828,159 @@ MmcStartStop(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST
 }
 
 /* ------------------------------------------------------------------ */
+/* eMMC hardware partitions (EMMCPART=)                                */
+/* ------------------------------------------------------------------ */
+
+/* A boot or general purpose partition as a disk of its own: the basic
+   disk commands, reads and writes polled with the partition selected for
+   them and the user area selected again afterwards */
+static VOID
+MmcProcessPartSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN PMMC_PART Part)
+{
+    PUCHAR cdb = Srb->Cdb;
+    UCHAR data[36];
+    MMC_LBA lba;
+    ULONG count = 0, result, n;
+    BOOLEAN isWrite = FALSE;
+    static const PCHAR names[8] = { "", "Boot Partition 1", "Boot Partition 2", "RPMB",
+                                    "General Part. 1 ", "General Part. 2 ", "General Part. 3 ", "General Part. 4 " };
+
+    ZeroMemoryBytes(data, sizeof(data));
+    lba.High = 0;
+    lba.Low = 0;
+    if (cdb[0] != SCSIOP_REQUEST_SENSE) Slot->SensePending = FALSE;
+
+    switch (cdb[0]) {
+    case SCSIOP_INQUIRY:
+        if ((cdb[1] & 0x01) || cdb[2] != 0) {
+            MmcInvalidField(Slot, Srb);
+            return;
+        }
+        data[2] = 5;                            /* SPC-3 */
+        data[3] = 2;
+        data[4] = 31;
+        CopyMemoryBytes(&data[8], "eMMC    ", 8);
+        CopyMemoryBytes(&data[16], names[Part->Access & 7], 16);
+        data[32] = (UCHAR)('0' + (MMC_DRIVER_VERSION >> 24) % 10);
+        data[33] = '.';
+        data[34] = (UCHAR)('0' + ((MMC_DRIVER_VERSION >> 16) & 0xFF) % 10);
+        data[35] = ' ';
+        MmcCopyToSrb(Srb, data, 36);
+        MmcGood(Srb);
+        return;
+
+    case SCSIOP_TEST_UNIT_READY:
+    case SCSIOP_MEDIUM_REMOVAL:
+    case MMC_SCSIOP_START_STOP_UNIT:
+        MmcGood(Srb);
+        return;
+
+    case SCSIOP_REQUEST_SENSE:
+        MmcHandleRequestSense(Slot, Srb);
+        return;
+
+    case SCSIOP_READ_CAPACITY:
+        MmcPutBigEndian32(&data[0], Part->Sectors - 1);
+        MmcPutBigEndian32(&data[4], MMC_BLOCK_SIZE);
+        MmcCopyToSrb(Srb, data, 8);
+        MmcGood(Srb);
+        return;
+
+    case MMC_SCSIOP_SERVICE_ACTION_IN16:
+        if ((cdb[1] & 0x1F) != 0x10) break;
+        MmcPutBigEndian32(&data[4], Part->Sectors - 1);
+        MmcPutBigEndian32(&data[8], MMC_BLOCK_SIZE);
+        n = MmcBigEndian32(&cdb[10]);
+        MmcCopyToSrb(Srb, data, (n < 32) ? n : 32);
+        MmcGood(Srb);
+        return;
+
+    case SCSIOP_MODE_SENSE:
+        /* header only: write protect bit */
+        data[0] = 3;
+        data[2] = (UCHAR)(Part->ReadOnly ? 0x80 : 0);
+        MmcCopyToSrb(Srb, data, (cdb[4] < 4) ? cdb[4] : 4);
+        MmcGood(Srb);
+        return;
+
+    case SCSIOP_MODE_SENSE10:
+        data[1] = 6;
+        data[3] = (UCHAR)(Part->ReadOnly ? 0x80 : 0);
+        n = ((ULONG)cdb[7] << 8) | cdb[8];
+        MmcCopyToSrb(Srb, data, (n < 8) ? n : 8);
+        MmcGood(Srb);
+        return;
+
+    case SCSIOP_SYNCHRONIZE_CACHE:
+    case MMC_SCSIOP_SYNC_CACHE16:
+        MmcCompleteResult(Slot, Srb, MmcFlush(HwInit, Slot), FALSE);
+        return;
+
+    case SCSIOP_READ6:
+    case SCSIOP_WRITE6:
+        lba.Low = ((ULONG)(cdb[1] & 0x1F) << 16) | ((ULONG)cdb[2] << 8) | cdb[3];
+        count = cdb[4] ? cdb[4] : 256;
+        isWrite = (BOOLEAN)(cdb[0] == SCSIOP_WRITE6);
+        goto rw;
+    case SCSIOP_READ:
+    case SCSIOP_WRITE:
+        lba.Low = MmcBigEndian32(&cdb[2]);
+        count = ((ULONG)cdb[7] << 8) | cdb[8];
+        isWrite = (BOOLEAN)(cdb[0] == SCSIOP_WRITE);
+        goto rw;
+    case MMC_SCSIOP_READ12:
+    case MMC_SCSIOP_WRITE12:
+        lba.Low = MmcBigEndian32(&cdb[2]);
+        count = MmcBigEndian32(&cdb[6]);
+        isWrite = (BOOLEAN)(cdb[0] == MMC_SCSIOP_WRITE12);
+        goto rw;
+    case MMC_SCSIOP_READ16:
+    case MMC_SCSIOP_WRITE16:
+        lba = MmcLbaFromBigEndian(&cdb[2], 8);
+        count = MmcBigEndian32(&cdb[10]);
+        isWrite = (BOOLEAN)(cdb[0] == MMC_SCSIOP_WRITE16);
+    rw:
+        if (count == 0) {
+            MmcGood(Srb);
+            return;
+        }
+        if (lba.High != 0 || lba.Low >= Part->Sectors || count > Part->Sectors - lba.Low) {
+            MmcFailWithSense(Slot, Srb, SCSI_SENSE_ILLEGAL_REQUEST, MMC_ASC_LBA_OUT_OF_RANGE, 0);
+            return;
+        }
+        if (count > Srb->DataTransferLength / MMC_BLOCK_SIZE) {
+            Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
+            return;
+        }
+        if (isWrite && Part->ReadOnly) {
+            MmcFailWithSense(Slot, Srb, SCSI_SENSE_DATA_PROTECT, MMC_ASC_WRITE_PROTECTED, 0);
+            return;
+        }
+        if (Slot->Outstanding != NULL) MmcDrainSlot(HwInit, Slot);
+        result = MmcSelectPartition(HwInit, Slot, Part->Access);
+        if (result == MMC_OK) {
+            Slot->WantAccess = Part->Access;
+            result = MmcReadWrite(HwInit, Slot, Srb, Srb->DataBuffer, lba, count, isWrite);
+            Slot->WantAccess = 0;
+        }
+        if (MmcSelectPartition(HwInit, Slot, 0) != MMC_OK) {
+            /* The user area must never be written through another partition */
+            Slot->NeedsInit = TRUE;
+        }
+        MmcCompleteResult(Slot, Srb, result, isWrite);
+        return;
+
+    case MMC_SCSIOP_REPORT_LUNS:
+        MmcHandleReportLuns(Srb, 1 + Slot->PartCount);
+        return;
+
+    default:
+        break;
+    }
+    MmcFailWithSense(Slot, Srb, SCSI_SENSE_ILLEGAL_REQUEST, MMC_ASC_INVALID_OPCODE, 0);
+}
+
+/* ------------------------------------------------------------------ */
 /* Entry                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -786,11 +997,16 @@ MmcSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         Srb->SrbStatus = SRB_STATUS_SELECTION_TIMEOUT;
         return;
     }
+    slot = &HwInit->Slots[Srb->TargetId];
     if (Srb->Lun != 0) {
-        Srb->SrbStatus = SRB_STATUS_NO_DEVICE;
+        /* EMMCPART=: the eMMC hardware partitions as LUN 1.. */
+        if (HwInit->EmmcParts && slot->CardReady && !slot->NeedsInit && Srb->Lun <= slot->PartCount) {
+            MmcProcessPartSrb(HwInit, slot, Srb, &slot->Parts[Srb->Lun - 1]);
+        } else {
+            Srb->SrbStatus = SRB_STATUS_NO_DEVICE;
+        }
         return;
     }
-    slot = &HwInit->Slots[Srb->TargetId];
 
     /* A card set up again after a power transition, an error or a stop */
     if (slot->NeedsInit && slot->Outstanding == NULL) {
@@ -798,8 +1014,9 @@ MmcSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         MmcCardInit(HwInit, slot);
     }
     if (!slot->CardReady) {
-        /* No card at all since start: the target does not exist */
-        if (slot->CardType == MMC_CARD_NONE && cdb[0] == SCSIOP_INQUIRY) {
+        /* No card at all since start: the target does not exist (with
+           HOTPLUG=1 it is a removable disk without a medium) */
+        if (slot->CardType == MMC_CARD_NONE && cdb[0] == SCSIOP_INQUIRY && !MmcSlotHotPlug(HwInit, slot)) {
             Srb->SrbStatus = SRB_STATUS_SELECTION_TIMEOUT;
             return;
         }
@@ -812,6 +1029,14 @@ MmcSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
             return;
         }
     }
+    /* HOTPLUG=1: the first command after a new card was set up reports
+       the change, so that the system reads the medium again */
+    if (slot->MediumChanged && slot->CardReady && cdb[0] != SCSIOP_INQUIRY && cdb[0] != SCSIOP_REQUEST_SENSE &&
+        cdb[0] != MMC_SCSIOP_REPORT_LUNS) {
+        slot->MediumChanged = FALSE;
+        MmcFailWithSense(slot, Srb, SCSI_SENSE_UNIT_ATTENTION, MMC_ASC_MEDIUM_CHANGED, 0);
+        return;
+    }
     if (cdb[0] != SCSIOP_REQUEST_SENSE) slot->SensePending = FALSE;
 
     switch (cdb[0]) {
@@ -822,7 +1047,7 @@ MmcSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         MmcHandleRequestSense(slot, Srb);
         return;
     case MMC_SCSIOP_REPORT_LUNS:
-        MmcHandleReportLuns(Srb);
+        MmcHandleReportLuns(Srb, 1 + (HwInit->EmmcParts ? slot->PartCount : 0));
         return;
     case SCSIOP_TEST_UNIT_READY:
     case SCSIOP_MEDIUM_REMOVAL:
@@ -834,6 +1059,10 @@ MmcSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         return;
     case MMC_SCSIOP_START_STOP_UNIT:
         MmcStartStop(HwInit, slot, Srb);
+        return;
+    case MMC_SCSIOP_SECURITY_IN:
+    case MMC_SCSIOP_SECURITY_OUT:
+        MmcHandleSecurity(HwInit, slot, Srb);
         return;
     case SCSIOP_READ_CAPACITY:
         MmcHandleReadCapacity10(HwInit, slot, Srb);
@@ -1006,6 +1235,16 @@ MmcProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
     case MMC_IOCTL_GET_INFO:
         if (available >= sizeof(MMC_IOCTL_INFO)) {
             MmcFillInfo(HwInit, (PMMC_IOCTL_INFO)((PUCHAR)ctl + ctl->HeaderLength));
+        } else {
+            ctl->ReturnCode = 1;
+        }
+        break;
+    case MMC_IOCTL_GET_LOCATION:
+        if (available >= sizeof(ULONG)) {
+            PCI_SLOT_NUMBER slot;
+            slot.u.AsULONG = HwInit->PciSlot;
+            *(PULONG)((PUCHAR)ctl + ctl->HeaderLength) = !HwInit->HasPci ? 0xFFFFFFFF :
+                (HwInit->PciBus << 16) | (slot.u.bits.DeviceNumber << 8) | slot.u.bits.FunctionNumber;
         } else {
             ctl->ReturnCode = 1;
         }

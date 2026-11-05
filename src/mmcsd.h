@@ -57,7 +57,7 @@
 #define MMC_DRIVER_NAME         "MMCSDNT"
 #endif
 
-#define MMC_DRIVER_VERSION      0x01010000  /* 1.1.0.0 */
+#define MMC_DRIVER_VERSION      0x01020000  /* 1.2.0.0 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -301,6 +301,8 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
                                          SDHCI_INT_SPACE_AVAIL | SDHCI_INT_DATA_AVAIL | SDHCI_INT_CARD_INSERT | \
                                          SDHCI_INT_CARD_REMOVE | SDHCI_INT_ERROR | SDHCI_INT_CMD_ERRORS | \
                                          SDHCI_INT_DATA_ERRORS)
+/* PIO by interrupt: how long the interrupt waits for the next block */
+#define MMC_PIO_SPIN_USEC               100
 /* Raised to the interrupt line while an interrupt-completed transfer runs */
 #define SDHCI_INT_SIGNAL_MASK           (SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_ERROR | \
                                          SDHCI_INT_CMD_ERRORS | SDHCI_INT_DATA_ERRORS)
@@ -420,6 +422,14 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 #define EXT_CSD_CACHE_CTRL              33
 #define EXT_CSD_POWER_OFF_NOTIFICATION  34
 #define EXT_CSD_ERASE_GROUP_DEF         175
+#define EXT_CSD_GP_SIZE_MULT            143         /* 3 bytes per general purpose partition */
+#define EXT_CSD_PARTITION_SETTING       155         /* bit 0: partitioning completed */
+#define EXT_CSD_BOOT_WP_STATUS          174
+#define EXT_CSD_PART_CONFIG             179         /* bits 2:0 partition access */
+#define EXT_CSD_PART_SWITCH_TIME        199         /* 10 ms units */
+#define EXT_CSD_HC_WP_GRP_SIZE          221
+#define EXT_CSD_BOOT_SIZE_MULT          226         /* 128 KB units */
+#define EXT_CSD_RPMB_SIZE_MULT          168         /* 128 KB units */
 #define EXT_CSD_BUS_WIDTH               183
 #define EXT_CSD_HS_TIMING               185
 #define EXT_CSD_REV                     192
@@ -491,13 +501,24 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 /* Timing                                                              */
 /* ------------------------------------------------------------------ */
 
-#define MMC_POLL_INTERVAL_USEC          10
+/* Polling (no interrupt): the first MMC_POLL_SPINS microseconds of checks
+   follow each other without a pause, so that a command done within
+   microseconds is seen at once; then one check per microsecond. A check
+   counts as its pause plus its register reads, so the time limits hold. */
+#define MMC_POLL_SPINS                  64
+#define MMC_POLL_INTERVAL_USEC          1
+#define MMC_POLL_STEP(elapsed, reads) { if ((elapsed) >= MMC_POLL_SPINS) ScsiPortStallExecution(MMC_POLL_INTERVAL_USEC); (elapsed) += MMC_POLL_INTERVAL_USEC + (reads); }
 #define MMC_CMD_TIMEOUT_MS              250         /* command line */
 #define MMC_INIT_TIMEOUT_MS             1500        /* ACMD41 / CMD1 power-up */
 #define MMC_BUSY_TIMEOUT_MS             3000        /* R1b, programming */
 #define MMC_POLL_TIMEOUT_DEFAULT_SEC    10
 #define MMC_POLL_TIMEOUT_MAX_SEC        60
 #define MMC_TIMER_USEC                  100000
+
+/* Hot plug (HOTPLUG=1): card detect is checked this often, and must
+   show the change this many checks in a row */
+#define MMC_HOTPLUG_USEC                500000
+#define MMC_HOTPLUG_CONFIRM             2
 #define MMC_MISSED_IRQ_LIMIT            5
 #define MMC_DMA_ERROR_LIMIT             3           /* then PIO for the slot */
 #define MMC_RETRY_LIMIT                 2           /* a failed transfer, card reinitialized */
@@ -555,8 +576,16 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 #define MMC_ASC_INVALID_PARAM_FIELD     0x26
 #define MMC_ASC_WRITE_PROTECTED         0x27
 #define MMC_ASC_NO_MEDIA                0x3A
+#define MMC_ASC_MEDIUM_CHANGED          0x28        /* not ready to ready change, medium may have changed */
 #define MMC_ASC_WRITE_ERROR             0x0C
 #define MMC_ASC_INTERNAL_FAILURE        0x44
+#define MMC_ASC_SEQUENCE_ERROR          0x2C        /* command sequence error */
+#define MMC_SCSIOP_SECURITY_IN          0xA2
+#define MMC_SCSIOP_SECURITY_OUT         0xB5
+#define MMC_SECURITY_RPMB               0xEC        /* security protocol of the RPMB (as UFS) */
+#define MMC_RPMB_NONE                   0
+#define MMC_RPMB_RESPONSE               1           /* RpmbFrame: a response for the next IN */
+#define MMC_RPMB_REQUEST                2           /* RpmbFrame: a read request, sent at the next IN */
 
 /* ------------------------------------------------------------------ */
 /* 64-bit block numbers without compiler 64-bit types                  */
@@ -594,6 +623,7 @@ typedef struct _MMC_SRB_IO_CONTROL {
    Through IOCTL_SCSI_MINIPORT to \\.\ScsiN:. */
 #define MMC_IOCTL_SIGNATURE             "MMCSDNT "
 #define MMC_IOCTL_GET_INFO              0x00000001
+#define MMC_IOCTL_GET_LOCATION          0x00000002  /* ULONG: bus << 16 | device << 8 | function, FFFFFFFFh none */
 #define MMC_IOCTL_POWER_DOWN            0x00000010
 #define MMC_IOCTL_POWER_UP              0x00000011
 #define MMC_IOCTL_TRIM_MODE_ON          0x00000020  /* 4 KB pattern after the header */
@@ -669,10 +699,22 @@ typedef struct _MMC_IOCTL_INFO {
 /* Driver state                                                        */
 /* ------------------------------------------------------------------ */
 
+/* eMMC hardware partition shown as LUN 1.. (EMMCPART=) */
+#define MMC_MAX_PARTS                   6           /* boot 1/2, general purpose 1-4 */
+typedef struct _MMC_PART {
+    UCHAR                   Access;         /* PARTITION_ACCESS value */
+    BOOLEAN                 ReadOnly;
+    ULONG                   Sectors;
+} MMC_PART, *PMMC_PART;
+
 typedef struct _MMC_SLOT {
     BOOLEAN                 Present;        /* registers mapped */
     BOOLEAN                 CardReady;      /* card initialized */
     BOOLEAN                 NeedsInit;      /* initialize again before the next request */
+    BOOLEAN                 HpCardIn;       /* hot plug: card detect at the last change */
+    UCHAR                   HpPolls;        /* checks in a row that saw it different */
+    BOOLEAN                 MediumChanged;  /* UNIT ATTENTION owed for a new card */
+    BOOLEAN                 CidValid;       /* Cid holds the last card's CID */
     BOOLEAN                 Async;          /* transfers complete in the interrupt */
     UCHAR                   Index;
     UCHAR                   HostVersion;
@@ -763,6 +805,22 @@ typedef struct _MMC_SLOT {
     BOOLEAN                 ActiveWrite;
     BOOLEAN                 ActiveMulti;
     BOOLEAN                 ActiveFua;
+    UCHAR                   ActiveXfer;     /* MMC_XFER_xxx of the transfer in flight */
+    /* eMMC hardware partitions */
+    UCHAR                   PartConfig;     /* PARTITION_CONFIG as the card has it */
+    UCHAR                   PartCount;
+    UCHAR                   WantAccess;     /* partition an I/O is for (0 = user area) */
+    ULONG                   PartSwitchMs;
+    /* RPMB through SECURITY PROTOCOL IN/OUT (ECh): the response of an
+       authenticated write, or the read request waiting for its IN */
+    UCHAR                   RpmbSize;       /* 128 KB units, 0: none */
+    UCHAR                   RpmbState;      /* MMC_RPMB_xxx */
+    UCHAR                   RpmbFrame[512];
+    MMC_PART                Parts[MMC_MAX_PARTS];
+    PUCHAR                  PioBuffer;      /* PIO: next block */
+    ULONG                   PioBlocks;      /* PIO: blocks still to move */
+    PUCHAR                  ActiveBuffer;   /* SDMA read: where the bounce buffer goes */
+    ULONG                   ActiveBytes;
 } MMC_SLOT, *PMMC_SLOT;
 
 typedef struct _HW_DEVICE_EXTENSION {
@@ -785,11 +843,16 @@ typedef struct _HW_DEVICE_EXTENSION {
     BOOLEAN                 UnmapAllowed;   /* TRIM=0: UNMAP refused */
     BOOLEAN                 Capacity16;     /* class driver follows up with READ CAPACITY(16) */
     BOOLEAN                 Hs400Allowed;   /* HS400=1 */
-    BOOLEAN                 CqAllowed;      /* CQ=1 or CQ=<offset> */
+    BOOLEAN                 CqAllowed;      /* on unless CQ=0; CQ=1 or CQ=<offset> for any host */
+    BOOLEAN                 CqAuto;         /* default: Intel hosts with the engine at 200h only */
+    UCHAR                   EmmcParts;      /* EMMCPART=1 (boot partitions read-only) or 2 */
     ULONG                   CqOffset;
     BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become discards */
     BOOLEAN                 Stopped;
     BOOLEAN                 TimerArmed;
+    BOOLEAN                 HotPlug;        /* HOTPLUG=1: cards come and go (removable medium) */
+    ULONG                   TimerUsec;      /* interval of the timer armed */
+    ULONG                   HpElapsed;      /* microseconds since the last card detect check */
     BOOLEAN                 DumpMode;
     BOOLEAN                 CheckState;
     ULONG                   MissedInterrupts;
@@ -841,6 +904,8 @@ typedef struct _MMC_REQUEST {
 #define MMC_ERR_CARD            4           /* R1 status reports an error */
 #define MMC_ERR_BAD_BUFFER      5           /* buffer cannot be described for DMA */
 #define MMC_ERR_NO_CARD         6
+#define MMC_ERR_CHANGED         7           /* another card in the slot (HOTPLUG=1) */
+#define MMC_ERR_SEQUENCE        8           /* RPMB IN without a request before it */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -890,6 +955,9 @@ ULONG   MmcReadWrite(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI
                      IN PVOID Buffer, IN MMC_LBA Lba, IN ULONG Count, IN BOOLEAN IsWrite);
 ULONG   MmcVerify(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN MMC_LBA Lba, IN ULONG Count);
 ULONG   MmcFlush(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot);
+ULONG   MmcSelectPartition(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN UCHAR Access);
+ULONG   MmcRpmbOut(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Count);
+ULONG   MmcRpmbIn(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQUEST_BLOCK Srb, IN ULONG Count);
 ULONG   MmcSetCache(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN BOOLEAN On);
 ULONG   MmcSleep(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN BOOLEAN Sleep);
 ULONG   MmcPowerOffNotify(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot);
@@ -904,6 +972,7 @@ UCHAR   MmcIssueAsync(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCS
 ULONG   MmcServiceSlot(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN BOOLEAN FromInterrupt);
 VOID    MmcDrainSlot(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot);
 VOID    MmcFailOutstanding(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN UCHAR SrbStatus);
+BOOLEAN MmcSlotHotPlug(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot);
 BOOLEAN MmcAckStray(IN PMMC_SLOT Slot);
 
 #if MMC_HAS_CQ

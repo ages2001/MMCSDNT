@@ -293,7 +293,7 @@ MmcPciIsSdhci(IN PPCI_COMMON_CONFIG PciConfig)
 
 /* Slot register blocks of a PCI SDHCI function: physical addresses */
 static ULONG
-MmcPciSlots(IN PPCI_COMMON_CONFIG PciConfig, OUT PULONG Bases)
+MmcPciSlots(IN PPCI_COMMON_CONFIG PciConfig, OUT PULONG Bases, OUT PULONG BasesHigh)
 {
     UCHAR info = PciConfig->DeviceSpecific[MMC_PCI_SLOT_INFO - 64];
     ULONG first = info & 0x07, count = ((info >> 4) & 0x07) + 1, n = 0, i, bar;
@@ -302,10 +302,14 @@ MmcPciSlots(IN PPCI_COMMON_CONFIG PciConfig, OUT PULONG Bases)
     for (i = 0; i < count && n < MMC_MAX_SLOTS; i++) {
         bar = PciConfig->u.type0.BaseAddresses[first + i];
         if ((bar & 1) || (bar & 0xFFFFFFF0) == 0) continue;     /* memory BARs only */
+        BasesHigh[n] = 0;
         if ((bar & 0x06) == 0x04) {                             /* 64-bit BAR: two entries */
             i++;
-            /* placed above 4 GB by the firmware: not reachable here */
-            if (first + i < PCI_TYPE0_ADDRESSES && PciConfig->u.type0.BaseAddresses[first + i] != 0) continue;
+            if (first + i < PCI_TYPE0_ADDRESSES) BasesHigh[n] = PciConfig->u.type0.BaseAddresses[first + i];
+#ifdef MMC_W9X
+            /* placed above 4 GB by the firmware: 9x maps only below */
+            if (BasesHigh[n] != 0) continue;
+#endif
         }
         Bases[n++] = bar & 0xFFFFFFF0;
     }
@@ -317,7 +321,7 @@ static BOOLEAN
 MmcScanPci(IN PHW_DEVICE_EXTENSION HwInit, OUT PULONG FoundBus, OUT PULONG FoundSlot, OUT PPCI_COMMON_CONFIG PciConfig)
 {
     PCI_SLOT_NUMBER slot;
-    ULONG bus, device, function, bases[MMC_MAX_SLOTS];
+    ULONG bus, device, function, bases[MMC_MAX_SLOTS], basesHigh[MMC_MAX_SLOTS];
     BOOLEAN busMissing, multiFunction;
 
     for (bus = 0; bus < 256; bus++) {
@@ -335,7 +339,7 @@ MmcScanPci(IN PHW_DEVICE_EXTENSION HwInit, OUT PULONG FoundBus, OUT PULONG Found
                 }
                 if (function == 0) multiFunction = (BOOLEAN)((PciConfig->HeaderType & MMC_PCI_MULTIFUNCTION) != 0);
                 if (!MmcPciIsSdhci(PciConfig)) continue;
-                if (MmcPciSlots(PciConfig, bases) == 0 || MmcIsClaimed(bases[0])) continue;
+                if (MmcPciSlots(PciConfig, bases, basesHigh) == 0 || MmcIsClaimed(bases[0])) continue;
                 *FoundBus = bus;
                 *FoundSlot = slot.u.AsULONG;
                 return TRUE;
@@ -486,6 +490,8 @@ MmcAllocateDma(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATIO
 /* Bring-up                                                            */
 /* ------------------------------------------------------------------ */
 
+static VOID MmcArmHotPlug(IN PHW_DEVICE_EXTENSION HwInit);
+
 static VOID
 MmcInitializeAll(IN PHW_DEVICE_EXTENSION HwInit)
 {
@@ -500,10 +506,13 @@ MmcInitializeAll(IN PHW_DEVICE_EXTENSION HwInit)
             /* No card, or it did not answer: the slot stays empty */
             slot->NeedsInit = FALSE;
         }
-        slot->Async = (BOOLEAN)(HwInit->AsyncMode && slot->Xfer == MMC_XFER_ADMA2);
+        slot->Async = HwInit->AsyncMode;
+        slot->HpCardIn = MmcCardPresent(slot);
+        slot->HpPolls = 0;
     }
     HwInit->Stopped = FALSE;
     HwInit->CheckState = FALSE;
+    MmcArmHotPlug(HwInit);
 }
 
 /* After a power transition: everything set up again. The cache setting
@@ -573,12 +582,82 @@ MmcPowerDown(IN PHW_DEVICE_EXTENSION HwInit)
 /* Interrupt watchdog                                                  */
 /* ------------------------------------------------------------------ */
 
+/* One timer per adapter: the interrupt watchdog (short) and the card
+   detect check (long). A request while one is pending is not passed on: the
+   pending one runs first and asks again, so that ScsiPort never gets a
+   second request for a timer it still holds. */
+static VOID
+MmcRequestTimer(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Usec)
+{
+    if (HwInit->TimerArmed) return;
+    HwInit->TimerArmed = TRUE;
+    HwInit->TimerUsec = Usec;
+    ScsiPortNotification(RequestTimerCall, HwInit, MmcTimer, Usec);
+}
+
 VOID
 MmcArmTimer(IN PHW_DEVICE_EXTENSION HwInit)
 {
-    if (HwInit->TimerArmed || !HwInit->AsyncMode) return;
-    HwInit->TimerArmed = TRUE;
-    ScsiPortNotification(RequestTimerCall, HwInit, MmcTimer, MMC_TIMER_USEC);
+    if (!HwInit->AsyncMode) return;
+    MmcRequestTimer(HwInit, MMC_TIMER_USEC);
+}
+
+static VOID
+MmcArmHotPlug(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    if (!HwInit->HotPlug || HwInit->Stopped) return;
+    MmcRequestTimer(HwInit, MMC_HOTPLUG_USEC);
+}
+
+/* HOTPLUG=1 applies to the slot: a card slot (an embedded eMMC stays a
+   fixed disk) */
+BOOLEAN
+MmcSlotHotPlug(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
+{
+    return (BOOLEAN)(HwInit->HotPlug && Slot->Present &&
+                     (Slot->Caps & SDHCI_SLOT_TYPE_MASK) != SDHCI_SLOT_TYPE_EMBEDDED);
+}
+
+/* Card detect of every card slot. A card that went: what was in flight
+   fails (ScsiPort retries it, then NOT READY, no medium), the clock and
+   power go off. A card that came: it is set up before the next request,
+   which gets UNIT ATTENTION (medium may have changed). */
+static VOID
+MmcHotPlugCheck(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    ULONG s;
+    BOOLEAN cardIn;
+
+    for (s = 0; s < HwInit->SlotCount; s++) {
+        PMMC_SLOT slot = &HwInit->Slots[s];
+        if (!MmcSlotHotPlug(HwInit, slot)) continue;
+        /* Card events are polled, never signalled; their status bits are
+           acknowledged, since a host may hold back the next card detect
+           until then */
+        MMC_WR(slot, SDHCI_INT_STATUS, SDHCI_INT_CARD_INSERT | SDHCI_INT_CARD_REMOVE);
+        cardIn = MmcCardPresent(slot);
+        if (cardIn == slot->HpCardIn) {
+            slot->HpPolls = 0;
+            continue;
+        }
+        if (++slot->HpPolls < MMC_HOTPLUG_CONFIRM) continue;
+        slot->HpPolls = 0;
+        slot->HpCardIn = cardIn;
+        slot->MediumChanged = TRUE;
+        if (cardIn) {
+            MMC_DBG((MMC_PFX "Slot %lu: card inserted\n", s));
+            slot->NeedsInit = TRUE;
+            continue;
+        }
+        MMC_DBG((MMC_PFX "Slot %lu: card removed\n", s));
+#if MMC_HAS_CQ
+        if (slot->CqBusy != 0) MmcCqFail(HwInit, slot, SRB_STATUS_BUS_RESET);
+#endif
+        if (slot->Outstanding != NULL || slot->Pending != NULL) MmcFailOutstanding(HwInit, slot, SRB_STATUS_BUS_RESET);
+        MmcHostStop(HwInit, slot);
+        slot->NeedsInit = FALSE;
+        slot->CardType = MMC_CARD_NONE;
+    }
 }
 
 static VOID
@@ -598,12 +677,12 @@ VOID
 MmcTimer(IN PVOID DeviceExtension)
 {
     PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
-    ULONG s, missed = 0;
+    ULONG s, missed = 0, elapsed = hwInit->TimerUsec;
     BOOLEAN pending = FALSE;
 
     hwInit->TimerArmed = FALSE;
-    if (!hwInit->AsyncMode || hwInit->Stopped) return;
-    for (s = 0; s < hwInit->SlotCount; s++) {
+    if (hwInit->Stopped) return;
+    for (s = 0; hwInit->AsyncMode && s < hwInit->SlotCount; s++) {
 #if MMC_HAS_CQ
         if (hwInit->Slots[s].CqBusy != 0) {
             ULONG before = hwInit->Slots[s].CqBusy;
@@ -619,9 +698,17 @@ MmcTimer(IN PVOID DeviceExtension)
     }
     if (missed != 0 && ++hwInit->MissedInterrupts >= MMC_MISSED_IRQ_LIMIT) {
         MmcDisableAsync(hwInit);
-        return;
+        pending = FALSE;
+    }
+    if (hwInit->HotPlug) {
+        hwInit->HpElapsed += elapsed;
+        if (hwInit->HpElapsed >= MMC_HOTPLUG_USEC) {
+            hwInit->HpElapsed = 0;
+            MmcHotPlugCheck(hwInit);
+        }
     }
     if (pending) MmcArmTimer(hwInit);
+    MmcArmHotPlug(hwInit);
 }
 
 /* ------------------------------------------------------------------ */
@@ -649,6 +736,8 @@ LONG __stdcall ZwCreateKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAt
                            ULONG TitleIndex, PVOID Class, ULONG CreateOptions, PULONG Disposition);
 LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
                              PVOID Data, ULONG DataSize);
+LONG __stdcall ZwQueryValueKey(PVOID KeyHandle, PVOID ValueName, ULONG KeyValueInformationClass,
+                               PVOID KeyValueInformation, ULONG Length, PULONG ResultLength);
 LONG __stdcall ZwClose(PVOID Handle);
 BOOLEAN __stdcall PsGetVersion(PULONG MajorVersion, PULONG MinorVersion, PULONG BuildNumber,
                                PMMC_UNICODE_STRING CsdVersion);
@@ -656,6 +745,15 @@ BOOLEAN __stdcall PsGetVersion(PULONG MajorVersion, PULONG MinorVersion, PULONG 
 #define MMC_OBJ_CASE_INSENSITIVE        0x00000040
 #define MMC_OBJ_KERNEL_HANDLE           0x00000200
 #define MMC_KEY_READ_WRITE              0x0002001F
+#define MMC_KEY_READ                    0x00020019
+#define MMC_KEY_VALUE_PARTIAL_INFORMATION 2
+
+typedef struct _MMC_KEY_VALUE_PARTIAL {
+    ULONG TitleIndex;
+    ULONG Type;
+    ULONG DataLength;
+    ULONG Data;
+} MMC_KEY_VALUE_PARTIAL;
 #define MMC_REG_CREATED_NEW_KEY         1
 #define MMC_REG_DWORD                   4
 
@@ -682,7 +780,9 @@ MmcInitAttributes(OUT MMC_OBJECT_ATTRIBUTES *Oa, IN PMMC_UNICODE_STRING Name, IN
    Parameters\PnpInterface ScsiPort does not start the PnP adapter (STOP
    0x7B). The entries the INF makes: PCI (5), and for ACPI device nodes
    Isa (1, what ScsiPort assumes for a node without a bus type), Internal
-   (0) and PNPBus (15). */
+   (0) and PNPBus (15). On a bare key the ACPI entries are made only when
+   the ACPI tree has an SD host node; otherwise the driver registers for
+   PCI alone, as the other ScsiPort miniports do. */
 static USHORT g_MmcParametersName[] = L"Parameters";
 static USHORT g_MmcPnpInterfaceName[] = L"PnpInterface";
 static USHORT g_MmcBus0[] = L"0";
@@ -692,22 +792,71 @@ static USHORT g_MmcBus15[] = L"15";
 
 /* Shorter names first: ScsiPort 5.0 reads each name into the buffer of
    the one before without clearing it, "1" after "15" would read as 15 */
-static const struct { USHORT *Text; ULONG Bytes; } g_MmcBusNames[] = {
-    { g_MmcBus0, sizeof(g_MmcBus0) }, { g_MmcBus1, sizeof(g_MmcBus1) },
-    { g_MmcBus5, sizeof(g_MmcBus5) }, { g_MmcBus15, sizeof(g_MmcBus15) }
+static const struct { USHORT *Text; ULONG Bytes; ULONG Bus; } g_MmcBusNames[] = {
+    { g_MmcBus0, sizeof(g_MmcBus0), 0 }, { g_MmcBus1, sizeof(g_MmcBus1), 1 },
+    { g_MmcBus5, sizeof(g_MmcBus5), 5 }, { g_MmcBus15, sizeof(g_MmcBus15), 15 }
 };
 
-static VOID
+#define MMC_BUS_BIT(b)                  (1UL << (b))
+#define MMC_ACPI_BUSES                  (MMC_BUS_BIT(0) | MMC_BUS_BIT(1) | MMC_BUS_BIT(15))
+
+/* ACPI ids of SD hosts (as in the INF) under Enum\ACPI */
+static USHORT g_MmcEnumAcpi[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\ACPI";
+static USHORT g_MmcAcpiId0[] = L"PNP0D40";
+static USHORT g_MmcAcpiId1[] = L"80860F14";
+static USHORT g_MmcAcpiId2[] = L"80860F16";
+static USHORT g_MmcAcpiId3[] = L"INT33BB";
+static USHORT g_MmcAcpiId4[] = L"INT3436";
+static USHORT g_MmcAcpiId5[] = L"80865ACA";
+static USHORT g_MmcAcpiId6[] = L"80865ACC";
+static USHORT g_MmcAcpiId7[] = L"80865AD0";
+static USHORT g_MmcAcpiId8[] = L"AMDI0040";
+static const struct { USHORT *Text; ULONG Bytes; } g_MmcAcpiIds[] = {
+    { g_MmcAcpiId0, sizeof(g_MmcAcpiId0) }, { g_MmcAcpiId1, sizeof(g_MmcAcpiId1) },
+    { g_MmcAcpiId2, sizeof(g_MmcAcpiId2) }, { g_MmcAcpiId3, sizeof(g_MmcAcpiId3) },
+    { g_MmcAcpiId4, sizeof(g_MmcAcpiId4) }, { g_MmcAcpiId5, sizeof(g_MmcAcpiId5) },
+    { g_MmcAcpiId6, sizeof(g_MmcAcpiId6) }, { g_MmcAcpiId7, sizeof(g_MmcAcpiId7) },
+    { g_MmcAcpiId8, sizeof(g_MmcAcpiId8) }
+};
+
+static BOOLEAN
+MmcAcpiHostPresent(VOID)
+{
+    MMC_OBJECT_ATTRIBUTES oa;
+    MMC_UNICODE_STRING name;
+    PVOID acpi, key;
+    ULONG i;
+    BOOLEAN found = FALSE;
+
+    MmcInitString(&name, g_MmcEnumAcpi, sizeof(g_MmcEnumAcpi));
+    MmcInitAttributes(&oa, &name, NULL);
+    if (ZwOpenKey(&acpi, MMC_KEY_READ, &oa) < 0) return FALSE;
+    for (i = 0; i < sizeof(g_MmcAcpiIds) / sizeof(g_MmcAcpiIds[0]) && !found; i++) {
+        MmcInitString(&name, g_MmcAcpiIds[i].Text, g_MmcAcpiIds[i].Bytes);
+        MmcInitAttributes(&oa, &name, acpi);
+        if (ZwOpenKey(&key, MMC_KEY_READ, &oa) >= 0) {
+            ZwClose(key);
+            found = TRUE;
+        }
+    }
+    ZwClose(acpi);
+    return found;
+}
+
+/* The bus types listed in Parameters\PnpInterface (bit n: type n), the
+   key made first on a bare service key */
+static ULONG
 MmcEnsurePnpInterface(IN PVOID RegistryPath)
 {
     MMC_OBJECT_ATTRIBUTES oa;
     MMC_UNICODE_STRING name;
     PVOID service, params, pnp;
-    ULONG disposition = 0, one = 1, i;
+    ULONG disposition = 0, one = 1, i, buses = 0, want, length;
+    MMC_KEY_VALUE_PARTIAL info;
 
-    if (RegistryPath == NULL) return;
+    if (RegistryPath == NULL) return MMC_BUS_BIT(5);
     MmcInitAttributes(&oa, (PMMC_UNICODE_STRING)RegistryPath, NULL);
-    if (ZwOpenKey(&service, MMC_KEY_READ_WRITE, &oa) < 0) return;
+    if (ZwOpenKey(&service, MMC_KEY_READ_WRITE, &oa) < 0) return MMC_BUS_BIT(5);
 
     MmcInitString(&name, g_MmcParametersName, sizeof(g_MmcParametersName));
     MmcInitAttributes(&oa, &name, service);
@@ -716,17 +865,30 @@ MmcEnsurePnpInterface(IN PVOID RegistryPath)
         MmcInitAttributes(&oa, &name, params);
         if (ZwCreateKey(&pnp, MMC_KEY_READ_WRITE, &oa, 0, NULL, 0, &disposition) >= 0) {
             if (disposition == MMC_REG_CREATED_NEW_KEY) {
+                want = MMC_BUS_BIT(5);
+                if (MmcAcpiHostPresent()) want |= MMC_ACPI_BUSES;
                 for (i = 0; i < sizeof(g_MmcBusNames) / sizeof(g_MmcBusNames[0]); i++) {
+                    if (!(want & MMC_BUS_BIT(g_MmcBusNames[i].Bus))) continue;
                     MmcInitString(&name, g_MmcBusNames[i].Text, g_MmcBusNames[i].Bytes);
                     ZwSetValueKey(pnp, &name, 0, MMC_REG_DWORD, &one, sizeof(one));
                 }
-                MMC_DBG((MMC_PFX "DriverEntry: Parameters\\PnpInterface added\n"));
+                MMC_DBG((MMC_PFX "DriverEntry: Parameters\\PnpInterface added (%s)\n",
+                         (want & MMC_ACPI_BUSES) ? "PCI and ACPI" : "PCI"));
+            }
+            for (i = 0; i < sizeof(g_MmcBusNames) / sizeof(g_MmcBusNames[0]); i++) {
+                MmcInitString(&name, g_MmcBusNames[i].Text, g_MmcBusNames[i].Bytes);
+                length = 0;
+                if (ZwQueryValueKey(pnp, &name, MMC_KEY_VALUE_PARTIAL_INFORMATION, &info, sizeof(info), &length) >= 0 &&
+                    info.Type == MMC_REG_DWORD && info.DataLength >= sizeof(ULONG) && info.Data != 0) {
+                    buses |= MMC_BUS_BIT(g_MmcBusNames[i].Bus);
+                }
             }
             ZwClose(pnp);
         }
         ZwClose(params);
     }
     ZwClose(service);
+    return buses | MMC_BUS_BIT(5);
 }
 #endif
 
@@ -743,6 +905,9 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 {
     HW_INITIALIZATION_DATA initData;
     ULONG status, status2;
+#if !defined(MMC_NT4)
+    ULONG buses = MMC_BUS_BIT(5);
+#endif
 
     g_MmcDumpMode = (BOOLEAN)(DriverObject == NULL);
     MMC_DBG((MMC_PFX "DriverEntry%s\n", g_MmcDumpMode ? " (dump)" : ""));
@@ -768,6 +933,10 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     ZeroMemoryBytes(&initData, sizeof(HW_INITIALIZATION_DATA));
 #ifdef MMC_NT31_COMPAT
     initData.HwInitializationDataSize = MMC_HWINIT_SIZE_NT35;
+#elif defined(MMC_W9X)
+    /* SCSIPORT.PDR fails any structure larger than 4Ch bytes (up to
+       DeviceId) with "Init Failure", before HwFindAdapter is called */
+    initData.HwInitializationDataSize = (ULONG)FIELD_OFFSET(HW_INITIALIZATION_DATA, DeviceId) + sizeof(PVOID);
 #else
     initData.HwInitializationDataSize = sizeof(HW_INITIALIZATION_DATA);
 #endif
@@ -799,7 +968,7 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 #endif
 
 #if !defined(MMC_NT4)
-    if (!g_MmcDumpMode) MmcEnsurePnpInterface(Argument2);
+    if (!g_MmcDumpMode) buses = MmcEnsurePnpInterface(Argument2);
 #endif
 
     status = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
@@ -830,11 +999,13 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 #else
     /* 2000/XP: PCI functions, and ACPI device nodes, which ScsiPort
        matches by their bus type (Isa when the node reports none; Internal
-       or PNPBus), all listed in Parameters\PnpInterface */
+       or PNPBus), each only where Parameters\PnpInterface lists it: a bus
+       type that is not listed would make ScsiPort detect legacy adapters */
     if (!g_MmcDumpMode || status != 0) {
         static const INTERFACE_TYPE acpiTypes[] = { Internal, Isa, PNPBus };
         ULONG t;
         for (t = 0; t < sizeof(acpiTypes) / sizeof(acpiTypes[0]); t++) {
+            if (!g_MmcDumpMode && !(buses & MMC_BUS_BIT(acpiTypes[t]))) continue;
             initData.AdapterInterfaceType = acpiTypes[t];
             status2 = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
             MMC_DBG((MMC_PFX "DriverEntry: bus type %lu: %08lX\n", (ULONG)acpiTypes[t], status2));
@@ -944,13 +1115,29 @@ MmcArg(IN PCHAR Args, IN PCHAR Key, OUT PULONG Value)
     return FALSE;
 }
 
+#if MMC_HAS_CQ
+/* Length of the memory range starting at Base, 0 if not among the ranges */
+static ULONG
+MmcRangeLength(IN PPORT_CONFIGURATION_INFORMATION ConfigInfo, IN ULONG Base)
+{
+    PACCESS_RANGE ranges = *ConfigInfo->AccessRanges;
+    ULONG i;
+
+    for (i = 0; ranges != NULL && i < ConfigInfo->NumberOfAccessRanges; i++) {
+        if (ranges[i].RangeInMemory && ranges[i].RangeStart.LowPart == Base) return ranges[i].RangeLength;
+    }
+    return 0;
+}
+#endif
+
 static VOID
-MmcSetAccessRange(IN PPORT_CONFIGURATION_INFORMATION ConfigInfo, IN ULONG Index, IN ULONG Base, IN ULONG Length)
+MmcSetAccessRange(IN PPORT_CONFIGURATION_INFORMATION ConfigInfo, IN ULONG Index, IN ULONG Base, IN ULONG BaseHigh,
+                  IN ULONG Length)
 {
     PACCESS_RANGE ranges = *ConfigInfo->AccessRanges;
 
     if (ranges == NULL || Index >= ConfigInfo->NumberOfAccessRanges) return;
-    ranges[Index].RangeStart.HighPart = 0;
+    ranges[Index].RangeStart.HighPart = (LONG)BaseHigh;
     ranges[Index].RangeStart.LowPart = Base;
     ranges[Index].RangeLength = Length;
     ranges[Index].RangeInMemory = TRUE;
@@ -968,11 +1155,11 @@ MmcFindAdapter(
 {
     PHW_DEVICE_EXTENSION hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
     PCI_COMMON_CONFIG pciConfig;
-    ULONG bases[MMC_MAX_SLOTS], count = 0, s, irq = 0, value;
+    ULONG bases[MMC_MAX_SLOTS], basesHigh[MMC_MAX_SLOTS], count = 0, s, irq = 0, value;
     ULONG targetBus = 0, targetSlot = 0;
     BOOLEAN hasSlot, pci = FALSE, ownEnumeration, levelIrq = TRUE, sdma = FALSE, dma64 = TRUE, interrupts;
 #if MMC_HAS_CQ
-    BOOLEAN cqMapped = FALSE;
+    BOOLEAN cqMapped = FALSE, cqFound = FALSE;
 #endif
     INTERFACE_TYPE busType;
     ULONG busNumber;
@@ -1000,13 +1187,31 @@ MmcFindAdapter(
     hwInit->Capacity16 = g_MmcCapacity16;
     if (MmcArg(ArgumentString, "RC16=1", NULL)) hwInit->Capacity16 = TRUE;
     if (MmcArg(ArgumentString, "RC16=0", NULL)) hwInit->Capacity16 = FALSE;
-    hwInit->Hs400Allowed = (BOOLEAN)(MmcArg(ArgumentString, "HS400=1", NULL) && hwInit->Hs200Allowed);
+    hwInit->HotPlug = (BOOLEAN)(MmcArg(ArgumentString, "HOTPLUG=1", NULL) && !hwInit->DumpMode);
+    /* HS400 after a working HS200 on an 8-bit eMMC whose host takes the
+       mode, on unless HS400=0 (a failure falls back to HS200) */
+    hwInit->Hs400Allowed = (BOOLEAN)(!MmcArg(ArgumentString, "HS400=0", NULL) && hwInit->Hs200Allowed);
+    /* EMMCPART=1: the eMMC boot and general purpose partitions as LUN 1..
+       (boot partitions read-only), EMMCPART=2: boot partitions writable */
+    hwInit->EmmcParts = (UCHAR)(MmcArg(ArgumentString, "EMMCPART=2", NULL) ? 2 :
+                                MmcArg(ArgumentString, "EMMCPART=1", NULL) ? 1 : 0);
+    if (hwInit->DumpMode) hwInit->EmmcParts = 0;
 #if MMC_HAS_CQ
-    /* CQ=1: the engine at the Intel offset 200h; CQ=<hex>: at that offset */
-    if (!hwInit->DumpMode && hwInit->DmaAllowed && MmcArg(ArgumentString, "CQ=", &value) && value != 0) {
+    /* Command queuing: on by default where the engine is known to be, at
+       200h on Intel PCI hosts whose register block reaches it; CQ=1: at
+       200h on any host, CQ=<hex>: at that offset, CQ=0: off. The engine
+       is used only when its version register reads 5.x. */
+    hwInit->CqOffset = MMC_CQ_DEFAULT_OFFSET;
+    hwInit->CqAllowed = TRUE;
+    hwInit->CqAuto = TRUE;
+    if (MmcArg(ArgumentString, "CQ=", &value)) {
+        hwInit->CqAuto = FALSE;
         hwInit->CqOffset = (value == 1) ? MMC_CQ_DEFAULT_OFFSET : (value & 0xFF00);
-        hwInit->CqAllowed = (BOOLEAN)(hwInit->CqOffset >= SDHCI_REG_SIZE && hwInit->CqOffset <= 0xF00);
+        hwInit->CqAllowed = (BOOLEAN)(value != 0 && hwInit->CqOffset >= SDHCI_REG_SIZE && hwInit->CqOffset <= 0xF00);
     }
+    if (hwInit->DumpMode || !hwInit->DmaAllowed) hwInit->CqAllowed = FALSE;
+    /* Partitions are switched with CMD6, which the card refuses in queue mode */
+    if (hwInit->EmmcParts) hwInit->CqAllowed = FALSE;
 #endif
     if (MmcArg(ArgumentString, "CLOCK=", &value) && value != 0) {
         /* MHz, given in decimal digits: read as hex, converted back */
@@ -1029,7 +1234,7 @@ MmcFindAdapter(
         targetBus = ConfigInfo->SystemIoBusNumber;
         targetSlot = ConfigInfo->SlotNumber;
         if (MmcReadPciHeader(hwInit, targetBus, targetSlot, &pciConfig, NULL) && MmcPciIsSdhci(&pciConfig)) {
-            count = MmcPciSlots(&pciConfig, bases);
+            count = MmcPciSlots(&pciConfig, bases, basesHigh);
             pci = (BOOLEAN)(count != 0 && (!ownEnumeration || !MmcIsClaimed(bases[0])));
         }
     }
@@ -1038,7 +1243,7 @@ MmcFindAdapter(
     /* 2: the next PCI SDHCI function (NT 4.0 and NT 3.1 enumerate themselves) */
     if (!pci && ownEnumeration && (ConfigInfo->AdapterInterfaceType != Isa || !hasSlot)) {
         if (MmcScanPci(hwInit, &targetBus, &targetSlot, &pciConfig)) {
-            count = MmcPciSlots(&pciConfig, bases);
+            count = MmcPciSlots(&pciConfig, bases, basesHigh);
             pci = TRUE;
         }
     }
@@ -1076,6 +1281,7 @@ MmcFindAdapter(
         for (i = 0; i < n && MmcIsClaimed(acpi[i].MmioBase); i++) ;
         if (i >= n) return SP_RETURN_NOT_FOUND;
         bases[0] = acpi[i].MmioBase;
+        basesHigh[0] = 0;
         count = 1;
         irq = acpi[i].Irq;
         levelIrq = acpi[i].LevelIrq;
@@ -1093,8 +1299,9 @@ MmcFindAdapter(
            block(s) from the resources */
         PACCESS_RANGE ranges = *ConfigInfo->AccessRanges;
         for (s = 0; ranges != NULL && s < ConfigInfo->NumberOfAccessRanges && count < MMC_MAX_SLOTS; s++) {
-            if (ranges[s].RangeInMemory && ranges[s].RangeLength >= SDHCI_REG_SIZE && ranges[s].RangeStart.LowPart != 0 &&
-                ranges[s].RangeStart.HighPart == 0) {
+            if (ranges[s].RangeInMemory && ranges[s].RangeLength >= SDHCI_REG_SIZE &&
+                (ranges[s].RangeStart.LowPart != 0 || ranges[s].RangeStart.HighPart != 0)) {
+                basesHigh[count] = (ULONG)ranges[s].RangeStart.HighPart;
                 bases[count++] = ranges[s].RangeStart.LowPart;
             }
         }
@@ -1137,8 +1344,8 @@ MmcFindAdapter(
         }
         ConfigInfo->BusInterruptLevel = irq;
         ConfigInfo->BusInterruptVector = irq;
-        for (s = 0; s < ConfigInfo->NumberOfAccessRanges; s++) MmcSetAccessRange(ConfigInfo, s, 0, 0);
-        for (s = 0; s < count; s++) MmcSetAccessRange(ConfigInfo, s, bases[s], SDHCI_REG_SIZE);
+        for (s = 0; s < ConfigInfo->NumberOfAccessRanges; s++) MmcSetAccessRange(ConfigInfo, s, 0, 0, 0);
+        for (s = 0; s < count; s++) MmcSetAccessRange(ConfigInfo, s, bases[s], basesHigh[s], SDHCI_REG_SIZE);
         *Again = TRUE;
     } else if (pci) {
         busType = PCIBus;
@@ -1176,7 +1383,9 @@ MmcFindAdapter(
         ZeroMemoryBytes(slot, sizeof(MMC_SLOT));
         slot->Index = (UCHAR)s;
         slot->RegsPhysical = bases[s];
-        pa.HighPart = 0;
+        /* A 64-bit BAR above 4 GB is mapped as it is (2000/XP/x64, and NT
+           with a PAE kernel; elsewhere the mapping fails) */
+        pa.HighPart = (LONG)basesHigh[s];
         pa.LowPart = bases[s];
 #ifdef MMC_W9X
         (VOID)pa;
@@ -1189,7 +1398,9 @@ MmcFindAdapter(
 #if MMC_HAS_CQ
         /* With the command queuing registers; without them where that
            much is not mapped */
-        if (hwInit->CqAllowed) {
+        if (hwInit->CqAllowed && (!hwInit->CqAuto ||
+                                  (hwInit->HasPci && hwInit->VendorId == 0x8086 &&
+                                   MmcRangeLength(ConfigInfo, bases[s]) >= hwInit->CqOffset + SDHCI_REG_SIZE))) {
             slot->Regs = (PUCHAR)ScsiPortGetDeviceBase(hwInit, busType, busNumber, pa,
                                                        hwInit->CqOffset + SDHCI_REG_SIZE, FALSE);
             cqMapped = (BOOLEAN)(slot->Regs != NULL);
@@ -1203,10 +1414,19 @@ MmcFindAdapter(
             MMC_DBG((MMC_PFX "FindAdapter: slot %lu at %08lX not mapped\n", s, bases[s]));
             return SP_RETURN_ERROR;
         }
-        if (MMC_RD(slot, SDHCI_SLOT_INT_VERSION) == 0xFFFFFFFF) {
+        if (MMC_RD(slot, SDHCI_SLOT_INT_VERSION) == 0xFFFFFFFF ||
+            (MMC_RD(slot, SDHCI_SLOT_INT_VERSION) == 0 && MMC_RD(slot, SDHCI_CAPABILITIES) == 0 &&
+             MMC_RD(slot, SDHCI_CAPABILITIES_1) == 0 && MMC_RD(slot, SDHCI_PRESENT_STATE) == 0)) {
+            /* All ones: nothing decodes the block; all zeros: a host that
+               is powered off or disabled (an ACPI node of a turned-off
+               controller) */
             MMC_DBG((MMC_PFX "FindAdapter: slot %lu at %08lX does not answer\n", s, bases[s]));
             return SP_RETURN_NOT_FOUND;
         }
+        /* No interrupt from the slot until the host is set up: the BIOS
+           may have left some enabled, and ScsiPort connects the line
+           before HwInitialize */
+        MMC_WR(slot, SDHCI_SIGNAL_ENABLE, 0);
         if (MmcSlotOff(ArgumentString, hwInit, s)) {
             /* OFF=: no card set up, no interrupts from the slot */
             MMC_WR(slot, SDHCI_SIGNAL_ENABLE, 0);
@@ -1218,6 +1438,7 @@ MmcFindAdapter(
         slot->Caps = MMC_RD(slot, SDHCI_CAPABILITIES);
 #if MMC_HAS_CQ
         if (cqMapped) MmcCqProbe(hwInit, slot);
+        if (slot->CqRegs != NULL) cqFound = TRUE;
         cqMapped = FALSE;
 #endif
         if (!(slot->Caps & SDHCI_CAN_ADMA2) && (slot->Caps & SDHCI_CAN_SDMA)) sdma = TRUE;
@@ -1254,17 +1475,18 @@ MmcFindAdapter(
 #endif
 
     /* Interrupt-completed transfers where an interrupt is connected; off
-       in the dump stack, with IRQ=0, on 9x unless IRQ=1 */
+       in the dump stack and with IRQ=0 */
     interrupts = (BOOLEAN)(ConfigInfo->BusInterruptLevel != 0 || ConfigInfo->BusInterruptVector != 0);
     if (hwInit->DumpMode) interrupts = FALSE;
-#ifdef MMC_W9X
-    if (!MmcArg(ArgumentString, "IRQ=1", NULL)) interrupts = FALSE;
-#endif
     hwInit->AsyncMode = interrupts;
 
     MMC_DBG((MMC_PFX "FindAdapter: %lu slot(s), IRQ %lu, %s%s\n", count, ConfigInfo->BusInterruptLevel,
              interrupts ? "interrupt" : "Fast Polling", hwInit->DmaAllowed ? "" : ", DMA off"));
 
+#if MMC_HAS_CQ
+    /* No engine on any slot: no memory for its descriptors */
+    if (!cqFound) hwInit->CqAllowed = FALSE;
+#endif
     if (!MmcAllocateDma(hwInit, ConfigInfo, sdma)) return SP_RETURN_ERROR;
     return SP_RETURN_FOUND;
 }
