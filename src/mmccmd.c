@@ -43,7 +43,20 @@ MmcResetLines(IN PMMC_SLOT Slot, IN ULONG Lines)
 {
     ULONG v, i;
 
+    /* a Ricoh controller without a card does not come back from a full reset */
+    if ((Slot->Quirks & MMC_QUIRK_NO_CARD_NO_RESET) && (Lines & SDHCI_RESET_ALL) &&
+        !(MMC_RD(Slot, SDHCI_PRESENT_STATE) & SDHCI_CARD_PRESENT)) {
+        return TRUE;
+    }
     v = MMC_RD(Slot, SDHCI_CLOCK_CONTROL) & 0x00FFFFFF;
+    if ((Slot->Quirks & MMC_QUIRK_CLOCK_BEFORE_RESET) && Slot->ClockKhz != 0) {
+        /* the internal clock on while the reset runs (Ricoh) */
+        v |= SDHCI_CLOCK_INT_EN;
+        MMC_WR(Slot, SDHCI_CLOCK_CONTROL, v);
+        for (i = 0; i < 20000 && !(MMC_RD(Slot, SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE); i += 10) {
+            ScsiPortStallExecution(10);
+        }
+    }
     MMC_WR(Slot, SDHCI_CLOCK_CONTROL, v | (Lines << 24));
     for (i = 0; i < 100000; i += 10) {
         if (((MMC_RD(Slot, SDHCI_CLOCK_CONTROL) >> 24) & Lines) == 0) return TRUE;
@@ -139,6 +152,8 @@ MmcSetClock(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN ULONG Khz)
     }
     MMC_WR(Slot, SDHCI_CLOCK_CONTROL, v | SDHCI_CLOCK_CARD_EN);
     Slot->ClockKhz = actual;
+    /* ENE: command and data lines go wrong after a clock change */
+    if (Slot->Quirks & MMC_QUIRK_RESET_ON_IOS) MmcResetLines(Slot, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
 }
 
 /* Reset the controller slot, power, 400 kHz, interrupts (status only) */
@@ -155,8 +170,21 @@ MmcHostInit(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
     Slot->HostVersion = (UCHAR)((v >> 16) & 0xFF);
     Slot->Caps = MMC_RD(Slot, SDHCI_CAPABILITIES);
     Slot->Caps1 = MMC_RD(Slot, SDHCI_CAPABILITIES_1);
+    Slot->Quirks = HwInit->Quirks;
+    if (Slot->Quirks & MMC_QUIRK_RICOH_CAPS) {
+        /* Ricoh R5C843/R5CE822/R5CE823: 33 MHz base and timeout clock, 3.3 V, high speed, SDMA */
+        Slot->Caps = (0x21UL << SDHCI_BASE_CLOCK_SHIFT) | 0x21 | 0x80 | SDHCI_CAN_VDD_330 | 0x00200000 |
+                     SDHCI_CAN_SDMA;
+        Slot->Caps1 = 0;
+    }
+    if (Slot->Quirks & MMC_QUIRK_FORCE_DMA) Slot->Caps |= SDHCI_CAN_SDMA;
+    if (Slot->Quirks & MMC_QUIRK_NO_DDR50) Slot->Caps1 &= ~SDHCI_CAN1_DDR50;
 
     if (!MmcResetLines(Slot, SDHCI_RESET_ALL)) return FALSE;
+    if (Slot->Quirks & MMC_QUIRK_JMICRON_MMC) {
+        /* JMicron's second (MMC) interface raises interrupts only with this bit */
+        MMC_WR(Slot, 0xC0, MMC_RD(Slot, 0xC0) | 0x01);
+    }
     if (Slot->Signal18) {
         /* The reset turned the power off: keep it off long enough for a
            card that signals at 1.8 V to start again at 3.3 V */
@@ -184,9 +212,11 @@ MmcHostInit(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
         power = SDHCI_POWER_180;
     }
     v = MMC_RD(Slot, SDHCI_HOST_CONTROL) & 0xFFFF0000;
-    MMC_WR(Slot, SDHCI_HOST_CONTROL, v | (power << 8));
+    if (!(Slot->Quirks & MMC_QUIRK_SINGLE_POWER_WRITE)) {
+        MMC_WR(Slot, SDHCI_HOST_CONTROL, v | (power << 8));
+    }
     MMC_WR(Slot, SDHCI_HOST_CONTROL, v | ((power | SDHCI_POWER_ON) << 8));
-    MmcDelayMs(2);
+    MmcDelayMs((Slot->Quirks & MMC_QUIRK_DELAY_AFTER_POWER) ? 10 : 2);
 
     /* Data timeout: the longest */
     v = MMC_RD(Slot, SDHCI_CLOCK_CONTROL) & 0x0000FFFF;
@@ -200,11 +230,12 @@ MmcHostInit(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot)
 
     /* Best data transfer method of the controller */
     Slot->Adma64 = FALSE;
-    if (!HwInit->DmaAllowed) {
+    if (!HwInit->DmaAllowed || (Slot->Quirks & MMC_QUIRK_BROKEN_DMA)) {
         Slot->XferBest = MMC_XFER_PIO;
-    } else if ((Slot->Caps & SDHCI_CAN_ADMA2) && Slot->HostVersion >= SDHCI_SPEC_200) {
+    } else if ((Slot->Caps & SDHCI_CAN_ADMA2) && Slot->HostVersion >= SDHCI_SPEC_200 &&
+               !(Slot->Quirks & MMC_QUIRK_BROKEN_ADMA)) {
         Slot->XferBest = MMC_XFER_ADMA2;
-        Slot->Adma64 = HwInit->Dma64;
+        Slot->Adma64 = (BOOLEAN)(HwInit->Dma64 && !(Slot->Quirks & MMC_QUIRK_32BIT_DMA));
     } else if ((Slot->Caps & SDHCI_CAN_SDMA) && HwInit->SdmaBounce != NULL) {
         Slot->XferBest = MMC_XFER_SDMA;
     } else {
@@ -546,8 +577,8 @@ MmcSendCommand(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PMMC_REQUES
 
 /* One command with optional data, polled. Data errors leave the card in
    the transfer state again (MmcRecover). */
-ULONG
-MmcExecute(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN OUT PMMC_REQUEST Req)
+static ULONG
+MmcExecuteOne(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN OUT PMMC_REQUEST Req)
 {
     ULONG mode = 0, result, st;
     UCHAR dma = MMC_XFER_PIO;
@@ -630,6 +661,15 @@ MmcExecute(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN OUT PMMC_REQUES
         }
     }
     return MMC_OK;
+}
+
+/* One request; JMicron (revision 0): command and data lines reset after it */
+ULONG
+MmcExecute(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN OUT PMMC_REQUEST Req)
+{
+    ULONG result = MmcExecuteOne(HwInit, Slot, Req);
+    if (Slot->Quirks & MMC_QUIRK_RESET_AFTER_REQUEST) MmcResetLines(Slot, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+    return result;
 }
 
 static ULONG
@@ -941,6 +981,7 @@ MmcSetBusWidth(IN PMMC_SLOT Slot, IN UCHAR Width)
     ULONG set = (Width == 8) ? SDHCI_CTRL_8BIT : (Width == 4) ? SDHCI_CTRL_4BIT : 0;
     MmcSetHostControl(Slot, SDHCI_CTRL_4BIT | SDHCI_CTRL_8BIT, set);
     Slot->BusWidth = Width;
+    if (Slot->Quirks & MMC_QUIRK_RESET_ON_IOS) MmcResetLines(Slot, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
 }
 
 /* Capacity from the CSD (SD all versions, MMC byte addressed) */

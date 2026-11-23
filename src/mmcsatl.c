@@ -606,14 +606,24 @@ MmcHandleModeSelect(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_
 /* Reads, writes, verify                                               */
 /* ------------------------------------------------------------------ */
 
+/* A 64-bit byte count kept as two ULONGs */
+static VOID
+MmcAddBytes(IN OUT PULONG Pair, IN ULONG Bytes)
+{
+    Pair[0] += Bytes;
+    if (Pair[0] < Bytes) Pair[1]++;
+}
+
 /* TRIM mode: a write whose data is the pattern, repeated from the first
-   byte, over its whole length */
+   byte, over its whole length. Any length: a file system splits a write at
+   fragment boundaries, and TRIMNT's pattern repeats every 512 bytes, so
+   every piece still matches. */
 static BOOLEAN
 MmcIsTrimPattern(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR Data, IN ULONG Length)
 {
     ULONG i, j;
 
-    if (Length < MMC_TRIM_PATTERN_SIZE) return FALSE;
+    if (Data == NULL || Length == 0) return FALSE;
     for (i = 0; i < Length; i += MMC_TRIM_PATTERN_SIZE) {
         for (j = 0; j < MMC_TRIM_PATTERN_SIZE && i + j < Length; j += 4) {
             if (*(ULONG UNALIGNED *)(Data + i + j) != *(ULONG UNALIGNED *)(&HwInit->TrimPattern[j])) return FALSE;
@@ -645,13 +655,17 @@ MmcScsiReadWrite(IN PHW_DEVICE_EXTENSION HwInit, IN PMMC_SLOT Slot, IN PSCSI_REQ
         MmcFailWithSense(Slot, Srb, SCSI_SENSE_DATA_PROTECT, MMC_ASC_WRITE_PROTECTED, 0);
         return;
     }
-    if (IsWrite && HwInit->TrimMode && HwInit->UnmapAllowed &&
-        MmcIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * MMC_BLOCK_SIZE)) {
+    if (IsWrite && HwInit->TrimMode && MmcIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * MMC_BLOCK_SIZE)) {
+        if (HwInit->UnmapAllowed) {
 #if MMC_HAS_CQ
-        MmcCqHalt(HwInit, Slot);
+            MmcCqHalt(HwInit, Slot);
 #endif
-        MmcCompleteResult(Slot, Srb, MmcUnmap(HwInit, Slot, Lba, Count), TRUE);
-        return;
+            result = MmcUnmap(HwInit, Slot, Lba, Count);
+            if (result == MMC_OK) MmcAddBytes(HwInit->TrimmedBytes, Count * MMC_BLOCK_SIZE);
+            MmcCompleteResult(Slot, Srb, result, TRUE);
+            return;
+        }
+        MmcAddBytes(HwInit->TrimWrittenBytes, Count * MMC_BLOCK_SIZE);
     }
 
 #if MMC_HAS_CQ
@@ -1210,6 +1224,23 @@ MmcFillInfo(IN PHW_DEVICE_EXTENSION HwInit, OUT PMMC_IOCTL_INFO Info)
     }
 }
 
+static VOID
+MmcTrimStatus(IN PHW_DEVICE_EXTENSION HwInit, IN OUT PMMC_TRIM_STATUS St)
+{
+    St->Flags = (UCHAR)(HwInit->TrimMode ? MMC_TRIM_STATUS_MODE_ON : 0);
+    St->BlockSize = 0;
+    if (St->PathId == 0 && St->Lun == 0 && St->TargetId < HwInit->SlotCount &&
+        HwInit->Slots[St->TargetId].Present && HwInit->Slots[St->TargetId].CardReady) {
+        St->Flags |= MMC_TRIM_STATUS_PRESENT;
+        if (HwInit->UnmapAllowed && !HwInit->Slots[St->TargetId].WriteProtected) St->Flags |= MMC_TRIM_STATUS_CAN_TRIM;
+        St->BlockSize = MMC_BLOCK_SIZE;
+    }
+    St->TrimmedLow = HwInit->TrimmedBytes[0];
+    St->TrimmedHigh = HwInit->TrimmedBytes[1];
+    St->WrittenLow = HwInit->TrimWrittenBytes[0];
+    St->WrittenHigh = HwInit->TrimWrittenBytes[1];
+}
+
 VOID
 MmcProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -1261,10 +1292,19 @@ MmcProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
             break;
         }
         CopyMemoryBytes(HwInit->TrimPattern, (PUCHAR)ctl + ctl->HeaderLength, MMC_TRIM_PATTERN_SIZE);
+        HwInit->TrimmedBytes[0] = HwInit->TrimmedBytes[1] = 0;
+        HwInit->TrimWrittenBytes[0] = HwInit->TrimWrittenBytes[1] = 0;
         HwInit->TrimMode = TRUE;
         break;
     case MMC_IOCTL_TRIM_MODE_OFF:
         HwInit->TrimMode = FALSE;
+        break;
+    case MMC_IOCTL_TRIM_STATUS:
+        if (available >= sizeof(MMC_TRIM_STATUS)) {
+            MmcTrimStatus(HwInit, (PMMC_TRIM_STATUS)((PUCHAR)ctl + ctl->HeaderLength));
+        } else {
+            ctl->ReturnCode = 1;
+        }
         break;
     default:
         Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;

@@ -291,6 +291,124 @@ MmcPciIsSdhci(IN PPCI_COMMON_CONFIG PciConfig)
                      (PciConfig->HeaderType & 0x7F) == 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* Controllers that need more than the SDHCI specification             */
+/* ------------------------------------------------------------------ */
+
+/* After Linux drivers/mmc/host/sdhci-pci-core.c and sdhci-pci-o2micro.c */
+static ULONG
+MmcPciQuirks(IN PPCI_COMMON_CONFIG PciConfig)
+{
+    USHORT v = PciConfig->VendorID, d = PciConfig->DeviceID;
+    UCHAR rev = PciConfig->RevisionID;
+
+    if (v == 0x1180) {                                          /* Ricoh */
+        if (d == 0x0822) {                                      /* R5C822 */
+            ULONG q = MMC_QUIRK_32BIT_DMA | MMC_QUIRK_FORCE_DMA | MMC_QUIRK_CLOCK_BEFORE_RESET;
+            if (PciConfig->u.type0.SubVendorID == 0x144D || PciConfig->u.type0.SubVendorID == 0x104D) {
+                q |= MMC_QUIRK_NO_CARD_NO_RESET;                /* Samsung, Sony */
+            }
+            return q;
+        }
+        if (d == 0x0843 || d == 0xE822 || d == 0xE823) {        /* R5C843, R5CE822, R5CE823 */
+            return MMC_QUIRK_32BIT_DMA | MMC_QUIRK_CLOCK_BEFORE_RESET | MMC_QUIRK_NO_CARD_NO_RESET |
+                   MMC_QUIRK_RICOH_CAPS;
+        }
+    }
+    if (v == 0x1524) {                                          /* ENE */
+        if (d == 0x0550 || d == 0x0551) return MMC_QUIRK_SINGLE_POWER_WRITE | MMC_QUIRK_BROKEN_DMA;
+        if (d == 0x0750 || d == 0x0751) {
+            return MMC_QUIRK_SINGLE_POWER_WRITE | MMC_QUIRK_BROKEN_DMA | MMC_QUIRK_RESET_ON_IOS;
+        }
+    }
+    if (v == 0x197B && (d == 0x2381 || d == 0x2382 || d == 0x2391 || d == 0x2392)) {  /* JMicron */
+        ULONG q = 0;
+        if (rev == 0) {
+            q |= MMC_QUIRK_32BIT_DMA | MMC_QUIRK_RESET_AFTER_REQUEST | MMC_QUIRK_BROKEN_ADMA;
+        }
+        if (d == 0x2382 || d == 0x2392) q |= MMC_QUIRK_JMICRON_MMC;
+        return q;
+    }
+    if (v == 0x1106 && d == 0x95D0 && rev == 0x10) return MMC_QUIRK_DELAY_AFTER_POWER;      /* VIA */
+    if (v == 0x10EC && d == 0x5250) return MMC_QUIRK_NO_PRESET | MMC_QUIRK_32BIT_DMA | MMC_QUIRK_NO_DDR50;  /* Realtek */
+    if (v == 0x1217) return MMC_QUIRK_BROKEN_ADMA * (d == 0x8220 || d == 0x8221 || d == 0x8320 || d == 0x8321);  /* O2 Micro */
+    return 0;
+}
+
+/* JMicron JMB38x/JMB388: the SD interface and the MMC interface are the
+   same hardware; with both present only the MMC one is taken (Linux) */
+static BOOLEAN
+MmcJmicronSecondary(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Bus, IN ULONG Slot, IN PPCI_COMMON_CONFIG PciConfig)
+{
+    PCI_SLOT_NUMBER s;
+    PCI_COMMON_CONFIG other;
+    ULONG fn;
+    USHORT mmc;
+
+    if (PciConfig->VendorID != 0x197B) return FALSE;
+    if (PciConfig->DeviceID == 0x2381) mmc = 0x2382;
+    else if (PciConfig->DeviceID == 0x2391) mmc = 0x2392;
+    else return FALSE;
+    s.u.AsULONG = Slot;
+    for (fn = 0; fn < 8; fn++) {
+        PCI_SLOT_NUMBER t = s;
+        t.u.bits.FunctionNumber = fn;
+        if (MmcReadPciHeader(HwInit, Bus, t.u.AsULONG, &other, NULL) &&
+            other.VendorID == 0x197B && other.DeviceID == mmc) {
+            MMC_DBG((MMC_PFX "JMicron %04lX at bus %lu slot %08lX: the MMC interface is taken instead\n",
+                     (ULONG)PciConfig->DeviceID, Bus, Slot));
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Chip set-up in configuration space: JMicron card power, O2 Micro
+   registers (as Linux does at probe time; again after a power transition) */
+static VOID
+MmcPciChipSetup(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    ULONG v;
+
+    if (!HwInit->HasPci) return;
+    if (HwInit->VendorId == 0x197B &&
+        (HwInit->DeviceId == 0x2381 || HwInit->DeviceId == 0x2382 ||
+         HwInit->DeviceId == 0x2391 || HwInit->DeviceId == 0x2392)) {
+        /* PMOS on, over-current detection at 2.4 V, debouncing */
+        v = MmcPciReadConfig(HwInit, 0xAC, 4);
+        MmcPciWriteConfig(HwInit, 0xAC, 4, v | (0x47UL << 16));
+    }
+    if (HwInit->VendorId == 0x1217 &&
+        (HwInit->DeviceId == 0x8220 || HwInit->DeviceId == 0x8221 ||
+         HwInit->DeviceId == 0x8320 || HwInit->DeviceId == 0x8321)) {
+        ULONG d0, e0, e4, ec, f0;
+        /* write protect off for the set-up registers */
+        d0 = MmcPciReadConfig(HwInit, 0xD0, 4);
+        MmcPciWriteConfig(HwInit, 0xD0, 4, d0 & ~(0x80UL << 24));
+        /* Multi 3 to VCC3V#; CLK_REQ# off after media detection */
+        ec = MmcPciReadConfig(HwInit, 0xEC, 4);
+        ec = (ec & ~(0xFFUL << 16)) | (0x08UL << 16);
+        ec |= 0x20;
+        MmcPciWriteConfig(HwInit, 0xEC, 4, ec);
+        /* capabilities: unlock, then SDMA */
+        e0 = MmcPciReadConfig(HwInit, 0xE0, 4);
+        MmcPciWriteConfig(HwInit, 0xE0, 4, e0 | 0x01);
+        e0 = MmcPciReadConfig(HwInit, 0xE0, 4);
+        MmcPciWriteConfig(HwInit, 0xE0, 4, (e0 & ~0xFFUL) | 0x73);
+        /* ADMA1/ADMA2 off (broken) */
+        e0 = MmcPciReadConfig(HwInit, 0xE0, 4);
+        MmcPciWriteConfig(HwInit, 0xE0, 4, (e0 & ~(0xFFUL << 16)) | (0x39UL << 16));
+        e4 = MmcPciReadConfig(HwInit, 0xE4, 4);
+        MmcPciWriteConfig(HwInit, 0xE4, 4, (e4 & ~(0xFFUL << 24)) | (0x08UL << 24));
+        /* infinite transfer mode off */
+        f0 = MmcPciReadConfig(HwInit, 0xF0, 4);
+        MmcPciWriteConfig(HwInit, 0xF0, 4, f0 | (0x08UL << 8));
+        /* write protect on again */
+        d0 = MmcPciReadConfig(HwInit, 0xD0, 4);
+        MmcPciWriteConfig(HwInit, 0xD0, 4, d0 | (0x80UL << 24));
+    }
+}
+
 /* Slot register blocks of a PCI SDHCI function: physical addresses */
 static ULONG
 MmcPciSlots(IN PPCI_COMMON_CONFIG PciConfig, OUT PULONG Bases, OUT PULONG BasesHigh)
@@ -339,6 +457,7 @@ MmcScanPci(IN PHW_DEVICE_EXTENSION HwInit, OUT PULONG FoundBus, OUT PULONG Found
                 }
                 if (function == 0) multiFunction = (BOOLEAN)((PciConfig->HeaderType & MMC_PCI_MULTIFUNCTION) != 0);
                 if (!MmcPciIsSdhci(PciConfig)) continue;
+                if (MmcJmicronSecondary(HwInit, bus, slot.u.AsULONG, PciConfig)) continue;
                 if (MmcPciSlots(PciConfig, bases, basesHigh) == 0 || MmcIsClaimed(bases[0])) continue;
                 *FoundBus = bus;
                 *FoundSlot = slot.u.AsULONG;
@@ -355,15 +474,16 @@ MmcScanPci(IN PHW_DEVICE_EXTENSION HwInit, OUT PULONG FoundBus, OUT PULONG Found
 /* ------------------------------------------------------------------ */
 
 /* Uncached extension: one page per slot for the scratch buffer, the
-   ADMA2 tables (four slots per page), and for an SDMA-only controller the
+   ADMA2 tables (two slots per page, four on 9x), and for an SDMA-only controller the
    bounce buffer. The area is not physically contiguous on every system
    (SCSIPORT.PDR): every page gets its own physical address. */
 #define MMC_ADMA_PAGES(slots)           (((slots) + MMC_ADMA_TABLES_PER_PAGE - 1) / MMC_ADMA_TABLES_PER_PAGE)
 #define MMC_DMA_PAGES(slots, sdma)      (1 + (slots) + MMC_ADMA_PAGES(slots) + \
                                          ((sdma) ? MMC_SDMA_BOUNCE_SIZE / MMC_PAGE_SIZE : 0))
-/* Command queuing: the task descriptor list page and two pages of
-   transfer descriptors (1 KB per task) per slot */
-#define MMC_CQ_PAGES                    3
+/* Command queuing: the task descriptor list page and the pages of
+   transfer descriptors (2 KB per task) per slot */
+#define MMC_CQ_TRD_PER_PAGE             (MMC_PAGE_SIZE / MMC_CQ_TRD_SIZE)
+#define MMC_CQ_PAGES                    (1 + (MMC_CQ_DEPTH + MMC_CQ_TRD_PER_PAGE - 1) / MMC_CQ_TRD_PER_PAGE)
 
 /* Physical address of a page of the area; 0 when it is not usable: not
    page aligned, or above 4 GB without 64-bit ADMA2 */
@@ -449,13 +569,13 @@ MmcAllocateDma(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATIO
             slot->CqTdlPhysical = MmcPagePhysical(HwInit, virt, &slot->CqTdlPhysicalHigh);
             if (slot->CqTdlPhysical == 0) ok = FALSE;
             for (t = 0; t < MMC_CQ_DEPTH; t++) {
-                p = t / (MMC_PAGE_SIZE / 1024);
-                slot->CqTrd[t] = virt + (1 + p) * MMC_PAGE_SIZE + (t % (MMC_PAGE_SIZE / 1024)) * 1024;
-                if (t % (MMC_PAGE_SIZE / 1024) == 0) {
+                p = t / MMC_CQ_TRD_PER_PAGE;
+                slot->CqTrd[t] = virt + (1 + p) * MMC_PAGE_SIZE + (t % MMC_CQ_TRD_PER_PAGE) * MMC_CQ_TRD_SIZE;
+                if (t % MMC_CQ_TRD_PER_PAGE == 0) {
                     phys = MmcPagePhysical(HwInit, virt + (1 + p) * MMC_PAGE_SIZE, &high);
                     if (phys == 0) ok = FALSE;
                 }
-                slot->CqTrdPhysical[t] = phys + (t % (MMC_PAGE_SIZE / 1024)) * 1024;
+                slot->CqTrdPhysical[t] = phys + (t % MMC_CQ_TRD_PER_PAGE) * MMC_CQ_TRD_SIZE;
                 slot->CqTrdPhysicalHigh[t] = high;
             }
             if (!ok || !HwInit->DmaAllowed) slot->CqTdl = NULL;
@@ -900,6 +1020,62 @@ MmcEnsurePnpInterface(IN PVOID RegistryPath)
 static BOOLEAN g_MmcFindAdapterCalled;
 #endif
 
+#ifdef MMC_W9X
+/* The Windows 9x loader does not clear the uninitialized data of a .MPD
+   (its RAM holds whatever was there): every global that has to start at
+   zero is cleared before anything reads it */
+static VOID
+MmcClearGlobals9x(VOID)
+{
+    ZeroMemoryBytes(&g_MmcCapacity16, sizeof(g_MmcCapacity16));
+    ZeroMemoryBytes(&g_MmcClaimed, sizeof(g_MmcClaimed));
+    ZeroMemoryBytes(&g_MmcClaimedCount, sizeof(g_MmcClaimedCount));
+}
+#endif
+
+#if !defined(MMC_W9X)
+/* NT family: NotInboxDriver = 1 in the driver's own service key. IDENT
+   turns the in-box atdisk and atapi services off on NT 3.1-4.0; an
+   "atapi" service that is this driver copied over atapi.sys carries the
+   value, and IDENT leaves it alone. Declared here: miniport.h has no
+   registry API. */
+typedef struct { USHORT Length; USHORT MaximumLength; USHORT *Buffer; } MMC_MARK_STRING;
+typedef struct { ULONG Length; PVOID RootDirectory; MMC_MARK_STRING *ObjectName; ULONG Attributes;
+                 PVOID SecurityDescriptor; PVOID SecurityQualityOfService; } MMC_MARK_ATTRIBUTES;
+LONG __stdcall ZwOpenKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes);
+LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
+                             PVOID Data, ULONG DataSize);
+LONG __stdcall ZwClose(PVOID Handle);
+static USHORT g_MmcNotInboxName[] = L"NotInboxDriver";
+
+static VOID
+MmcMarkNotInbox(IN PVOID RegistryPath)
+{
+    MMC_MARK_ATTRIBUTES oa;
+    MMC_MARK_STRING name;
+    PVOID key;
+    ULONG one = 1;
+
+    if (RegistryPath == NULL) return;
+    oa.Length = sizeof(oa);
+    oa.RootDirectory = NULL;
+    oa.ObjectName = (MMC_MARK_STRING *)RegistryPath;
+#if defined(MMC_NT4)
+    oa.Attributes = 0x00000040;             /* OBJ_CASE_INSENSITIVE (NT 4.0 rejects OBJ_KERNEL_HANDLE) */
+#else
+    oa.Attributes = 0x00000240;             /* OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE */
+#endif
+    oa.SecurityDescriptor = NULL;
+    oa.SecurityQualityOfService = NULL;
+    if (ZwOpenKey(&key, 0x0002001F, &oa) < 0) return;  /* KEY_READ | KEY_WRITE */
+    name.Buffer = g_MmcNotInboxName;
+    name.Length = (USHORT)(sizeof(g_MmcNotInboxName) - sizeof(USHORT));
+    name.MaximumLength = (USHORT)sizeof(g_MmcNotInboxName);
+    ZwSetValueKey(key, &name, 0, 4, &one, sizeof(one));    /* REG_DWORD */
+    ZwClose(key);
+}
+#endif
+
 ULONG
 DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 {
@@ -909,6 +1085,9 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     ULONG buses = MMC_BUS_BIT(5);
 #endif
 
+#ifdef MMC_W9X
+    MmcClearGlobals9x();
+#endif
     g_MmcDumpMode = (BOOLEAN)(DriverObject == NULL);
     MMC_DBG((MMC_PFX "DriverEntry%s\n", g_MmcDumpMode ? " (dump)" : ""));
 
@@ -969,6 +1148,9 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
 #if !defined(MMC_NT4)
     if (!g_MmcDumpMode) buses = MmcEnsurePnpInterface(Argument2);
+#endif
+#if !defined(MMC_W9X)
+    if (!g_MmcDumpMode) MmcMarkNotInbox(Argument2);
 #endif
 
     status = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
@@ -1233,7 +1415,8 @@ MmcFindAdapter(
     if (hasSlot && ConfigInfo->AdapterInterfaceType == PCIBus) {
         targetBus = ConfigInfo->SystemIoBusNumber;
         targetSlot = ConfigInfo->SlotNumber;
-        if (MmcReadPciHeader(hwInit, targetBus, targetSlot, &pciConfig, NULL) && MmcPciIsSdhci(&pciConfig)) {
+        if (MmcReadPciHeader(hwInit, targetBus, targetSlot, &pciConfig, NULL) && MmcPciIsSdhci(&pciConfig) &&
+            !MmcJmicronSecondary(hwInit, targetBus, targetSlot, &pciConfig)) {
             count = MmcPciSlots(&pciConfig, bases, basesHigh);
             pci = (BOOLEAN)(count != 0 && (!ownEnumeration || !MmcIsClaimed(bases[0])));
         }
@@ -1259,6 +1442,11 @@ MmcFindAdapter(
         levelIrq = TRUE;
         /* Memory space and bus master on */
         if ((pciConfig.Command & 0x0006) != 0x0006) MmcPciWriteConfig(hwInit, 0x04, 2, pciConfig.Command | 0x0006);
+        hwInit->Quirks = MmcPciQuirks(&pciConfig);
+        MmcPciChipSetup(hwInit);
+        if (hwInit->Quirks != 0) {
+            MMC_DBG((MMC_PFX "FindAdapter: controller quirks %08lX\n", hwInit->Quirks));
+        }
         MMC_DBG((MMC_PFX "FindAdapter: %04lX:%04lX at bus %lu slot %08lX, progif %02lX, %lu slot(s) at %08lX\n",
                  (ULONG)pciConfig.VendorID, (ULONG)pciConfig.DeviceID, targetBus, targetSlot,
                  (ULONG)pciConfig.ProgIf, count, bases[0]));
@@ -1741,6 +1929,7 @@ MmcAdapterControl(IN PVOID DeviceExtension, IN SCSI_ADAPTER_CONTROL_TYPE Control
         return ScsiAdapterControlSuccess;
     case ScsiRestartAdapter:
         MMC_DBG((MMC_PFX "AdapterControl: restart\n"));
+        MmcPciChipSetup(hwInit);
         MmcReinitialize(hwInit);
         return ScsiAdapterControlSuccess;
     default:

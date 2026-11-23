@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.2.0.0 |
-| **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 |
+| **Version** | 1.3 |
+| **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 · Windows Vista / 7 (x86 tested; x64 with a test signature) |
 | **Hardware** | SD host controllers (SDHCI 1.00–3.00) on PCI (class code `08-05`) or described only by ACPI (Intel Bay Trail, Cherry Trail, Braswell, Apollo Lake, AMD and others); up to 6 slots per controller, 32 controllers |
 | **Cards** | SD, SDHC and SDXC (up to UHS-I SDR104), MMC and eMMC (up to HS400) |
 | **Binaries** | `mmcsd9x.mpd` (Windows 9x/Me) · `mmcsdnt.sys` (NT 3.1–4.0) · `mmcsdnt.sys` (2000/XP/2003, x86 and x64) · `mmccfg.exe` (port program, NT 3.1–4.0 and 9x/Me) |
@@ -66,7 +66,7 @@ None of these systems knows SD host controllers at all. Windows XP got an SD bus
   - Cards larger than 2 TB (SDUC) are not addressed; eMMC boot and general purpose partitions are LUN 1.. of the slot with `EMMCPART=1/2` (see [eMMC hardware partitions](#emmc-hardware-partitions)); the **RPMB** is reached through SECURITY PROTOCOL IN/OUT (protocol ECh, as on UFS devices), see [RPMB](#rpmb)
 
 - **Transfer methods**
-  - **ADMA2** (32-bit descriptors, or 64-bit on hosts that have them; 64 entries per slot, one per page): scatter/gather straight to and from the request buffer, 128 KB per request, 32 physical breaks
+  - **ADMA2** (32-bit descriptors, or 64-bit on hosts that have them; 160 entries per slot, one per page): scatter/gather straight to and from the request buffer, 512 KB per request, 128 physical breaks (9x: 64 entries, 128 KB, 32)
   - **SDMA** on hosts without ADMA2: through a 64 KB bounce buffer
   - **PIO** on hosts without DMA, with `DMA=0`, for a buffer that is not dword-aligned, and after three DMA errors on a slot
   - Multi-block reads and writes with Auto CMD12
@@ -80,6 +80,12 @@ None of these systems knows SD host controllers at all. Windows XP got an SD bus
   - MODE SENSE(6)/(10) with the rigid disk geometry, caching (`08h`, WCE = eMMC cache) and control pages; MODE SELECT on the caching page turns the eMMC cache on and off (refused with ILLEGAL REQUEST on a card without one)
   - START STOP UNIT: stop = flush, deselect, clock off; the next request sets the card up again
   - INQUIRY VERSION `05h` (SPC-3), so the 16-byte CDBs are used where the OS knows them
+
+- **Controllers that need more than the SDHCI specification** (after Linux `drivers/mmc/host/sdhci-pci-core.c` and `sdhci-pci-o2micro.c`); see [Controller quirks](#controller-quirks)
+  - Ricoh R5C822 (32-bit DMA, SDMA forced, clock on for a reset; no reset without a card on Samsung and Sony boards), R5C843/R5CE822/R5CE823 (capabilities register replaced: 33 MHz, 3.3 V, high speed, SDMA)
+  - ENE CB712/CB714 (no DMA, voltage and power in one write; CB714: command and data lines reset after a clock or bus width change)
+  - JMicron JMB38x/JMB388 (card power through PMOS at `AEh`; of the SD and MMC interfaces of one chip only the MMC one, enabled at `C0h`; revision 0: no ADMA, 32-bit DMA, lines reset after each request)
+  - O2 Micro 8220/8221/8320/8321 (set-up in configuration space: capabilities unlocked to SDMA, ADMA off, infinite transfer mode off), VIA VX855 revision 10h (10 ms after power on), Realtek RTS5250 SDHCI (no preset values, 32-bit DMA, no DDR50)
 
 - **Multi-target support from one source tree**
   - Windows 95 / 98 / Me (x86) — `SCSIPORT.PDR` miniport (`mmcsd9x.mpd`)
@@ -143,12 +149,15 @@ None of these systems knows SD host controllers at all. Windows XP got an SD bus
 | Auto-sense on error (`SRB_STATUS_AUTOSENSE_VALID`) | No — the class driver issues REQUEST SENSE | No — the class driver issues REQUEST SENSE | Yes |
 | Memory above 4 GB (PAE, x64) | Not used by 9x | Not used by NT 3.1–4.0 | 64-bit ADMA2 where every slot of the host has it (buffers above 4 GB go to the host directly); otherwise 32-bit ADMA2/SDMA: ScsiPort double-buffers pages above 4 GB, PIO for a buffer it reports above 4 GB (tested on XP x64 with 2 GB above 4 GB and on 2000 `/PAE` with 4 GB) |
 | Card change (`HOTPLUG=1`, off by default) | Same as NT | Card slots are removable drives; a card pulled leaves the drive without a medium, a card inserted is read at the next access | Same as NT |
-| Max transfer size per I/O | 128 KB (64 KB on an SDMA-only host) | Same | Same |
+| Max transfer size per I/O | 128 KB (64 KB on an SDMA-only host) | 512 KB (64 KB per command on an SDMA-only host) | Same as NT |
 | Debug output | VMM `_Debug_Printf_Service` (`DEBUG=1` builds), prefix `[mmcsd9x]` | `DbgPrint`, prefix `[MMCSDNT]` | `DbgPrint`, prefix `[MMCSDNT]` |
 
 ## Known Limitations
 
+- Windows Vista and later: tested on Windows Vista SP2 x86 and Windows 7 SP1 x86 (as a data and as the boot controller, with hibernation and crash dumps); Windows 10 x64 testing was not finished; the x64 build needs test mode there (`bcdedit /set testsigning on`); Windows 8 and later were not tested
 - **Card change only with `HOTPLUG=1`**: by default cards are found at `HwInitialize` and again after a power transition or reset, the driver is meant for an eMMC or an SD card that stays in its slot, and a card pulled while Windows runs fails its requests (it is not reported as removed media) while a card inserted later is seen at the next boot. With `HOTPLUG=1` the card slots are removable drives (see [Card change](#card-change))
+- **Card readers without SDHCI registers are not supported**: Realtek RTS5209/5227/5229/522A/5249/524A/525A/5260/5261 PCIe readers (Linux `rtsx_pci`), Alcor Micro AU6601/AU6621 (`alcor`) and Toshiba/Ricoh MemoryStick-only functions have register sets of their own; each would need a host driver of its own. Only the Realtek RTS5250, which is SDHCI, is taken
+- **Vendor UHS-I set-up not ported**: the PLL, tuning and clock programming Linux does for O2 Micro SDS/Seabird/FUJIN2, Genesys GL9750/9755/9763E and AMD hosts is not done; these controllers run in the standard SDHCI modes their firmware left set up
 - **No UHS-II, UHS-III or SD Express**
 - **HS400** (on by default, `HS400=0` off): the vendor strobe and delay-line settings are not programmed; the EXT_CSD read back after the switch decides, and a card that fails it is set up again with HS200. **eMMC command queuing** on 2000/XP/x64 only, by default only on Intel PCI hosts whose register block reaches the engine at 200h (`CQ=1` / `CQ=xxx` for other hosts). Both were tested only against an emulated host (see `TESTS.TXT`)
 - Tuning uses the host's tuning circuit (SDHCI 3.00 Execute Tuning), tried again once and then at 150 and 100 MHz in the same mode before the next slower mode is taken; hosts that need vendor sampling-clock settings are not tuned beyond that
@@ -337,6 +346,14 @@ Copy the contents of `bin\2KXP\floppy_i386\` (x86) or `bin\2KXP\floppy_amd64\` (
 
 The machine has to boot from the card after setup: that is the firmware's job (an SD/eMMC boot entry in the BIOS or CSM). A full (not quick) format makes text-mode setup read the whole card once; on a slow card this takes a while.
 
+#### Windows Vista / 7 and later
+
+The 2000/XP files in `bin\2KXP` also run on Windows Vista and Windows 7 (ScsiPort is still part of them); tested on Windows Vista SP2 x86 and Windows 7 SP1 x86. Windows 8, 8.1, 10 and 11 were not tested.
+
+- **x86:** Device Manager → the controller → **Update Driver Software** → **Browse my computer** → **Let me pick** → **Have Disk**, `bin\2KXP\mmcsdnt.inf`, and confirm *Install this driver software anyway*. For a controller without a driver, `pnputil -i -a mmcsdnt.inf` from an administrator prompt installs it as well on Windows 7 (not on Vista, whose pnputil leaves such a device alone: use Device Manager there). Windows' own signed driver (sdbus/sffdisk) is preferred by Windows, so the driver has to be picked explicitly.
+- **x64:** 64-bit Vista and later load only signed kernel drivers. The `amd64` driver carries a test signature (SHA-1, certificate `bin\2KXP\ages2001test.cer`); turn test mode on with `bcdedit /set testsigning on` from an administrator prompt and restart, then install as on x86. Without test mode Windows refuses to load it.
+- Windows Vista and later take a disk offline whose MBR disk signature equals that of another disk (for example two copies of one image); `diskpart`'s `online disk` brings it back. That is not the driver.
+
 #### Windows NT 3.1 / 3.50 / 3.51 / NT 4.0
 
 NT uses the older OEM Setup mechanism (`oemsetup.inf`). Use **"Have Disk"** in **Windows NT Setup → SCSI Adapters** (NT 3.x) or **Control Panel → SCSI Adapters → Drivers → Add** (NT 4.0), or the OEM prompt of text-mode setup, point it at `bin\NT\floppy\`, and select **MMCSDNT SD/MMC/eMMC Storage Controller (ages2001)**. Windows NT 3.1 has no *SCSI Adapters* applet for added drivers: create the service by hand (see [Configuration](#configuration)) and copy `mmcsdnt.sys` to `system32\drivers`.
@@ -371,7 +388,7 @@ On the NT family the driver reads the ScsiPort argument string, the `REG_SZ` val
 | `HS=0` | No high speed: SD at 25 MHz, MMC at 26 MHz (MMC 20 MHz before) at most |
 | `CLOCK=n` | Highest card clock in MHz (decimal), for a slot with bad signal quality |
 | `IRQ=0` | No interrupt: everything Fast Polling. Use this on a machine whose interrupt routing is wrong (the watchdog would get there on its own after five missed interrupts) |
-| `IRQ=1` | Windows NT 3.1: also connect the INTx line of a PCI host. On 9x the interrupt is used by default since 1.2.0.0 |
+| `IRQ=1` | Windows NT 3.1: also connect the INTx line of a PCI host. On 9x the interrupt is used by default since 1.2 |
 | `EMMCPART=1` / `EMMCPART=2` | The eMMC boot partitions 1/2 and the general purpose partitions 1–4 as LUN 1, 2, ... of the slot; boot partitions read-only with `EMMCPART=1`, writable with `EMMCPART=2` (unless the card write-protects them). Turns `CQ=` off. See [eMMC hardware partitions](#emmc-hardware-partitions) |
 | `BASE=xxxxxxxx` | NT 3.1–4.0 and 9x: the physical address (hexadecimal) of the register block of a host only ACPI describes, when the driver does not find it in the tables; with `IRQ=n` (hexadecimal, ISA IRQ 1–F) for its interrupt |
 | `UHS=0` | No 1.8 V modes at all: no UHS-I for SD, no HS200/HS400/DDR52 for eMMC |
@@ -416,9 +433,9 @@ The limits are compile-time constants in `src\mmcsd.h`:
 ```c
 #define MMC_MAX_SLOTS                   6           /* per PCI function (SDHCI) */
 #define MMC_MAX_CONTROLLERS             32
-#define MMC_MAX_TRANSFER                0x20000     /* 128 KB */
-#define MMC_MAX_PHYS_BREAKS             32
-#define MMC_ADMA_ENTRIES                64          /* 8 or 12 bytes each, 1 KB per slot */
+#define MMC_MAX_TRANSFER                0x80000     /* 512 KB (9x: 0x20000, 128 KB) */
+#define MMC_ADMA_ENTRIES                160         /* 8 or 12 bytes each, 2 KB per slot (9x: 64, 1 KB) */
+#define MMC_MAX_PHYS_BREAKS             (MMC_MAX_TRANSFER / 4096)
 #define MMC_SCRATCH_SIZE                4096        /* EXT_CSD, SCR, switch status, VERIFY */
 #define MMC_SDMA_BOUNCE_SIZE            0x10000     /* SDMA-only controllers */
 #define MMC_MISSED_IRQ_LIMIT            5
@@ -428,7 +445,7 @@ The limits are compile-time constants in `src\mmcsd.h`:
 
 - **`MMC_MAX_SLOTS`** follows the SDHCI specification (at most six slots per PCI function); the target ID of a card is its slot number
 - **`MMC_MAX_CONTROLLERS`** sizes the table that records which hosts (by the physical address of the first register block) a driver instance has claimed, so that two instances (PCI pass and ACPI pass) never drive the same host
-- **`MMC_MAX_TRANSFER`** and **`MMC_MAX_PHYS_BREAKS`** are what ScsiPort is told; 64 ADMA2 descriptors cover a 128 KB request split at every page
+- **`MMC_MAX_TRANSFER`** and **`MMC_MAX_PHYS_BREAKS`** are what ScsiPort is told; 160 ADMA2 descriptors (and as many command queuing transfer descriptors per task) cover a 512 KB request split at every page (129 pages); 64 cover 128 KB on 9x
 - `MMC_CQ_DEPTH` (8) is how many command queuing tasks the driver keeps in flight per card (at most the card's queue depth)
 - **`MMC_MISSED_IRQ_LIMIT`**, **`MMC_DMA_ERROR_LIMIT`** and **`MMC_RETRY_LIMIT`** set when the driver gives up on interrupts (per adapter), on DMA (per slot) and on a failing transfer (it sets the card up again and retries twice)
 
@@ -533,6 +550,7 @@ The replay protected memory block of an eMMC (`RPMB_SIZE_MULT` × 128 KB) is rea
 | `"MMCSDNT "` | `2` GET_LOCATION | Returns a `ULONG`: the host's PCI location, bus in bits 31:16, device in 15:8, function in 7:0; `FFFFFFFFh` for a host only ACPI describes (for the port program on NT 3.1–4.0) |
 | `"MMCSDNT "` | `20h` TRIM_MODE_ON | A 4 KB pattern follows the header: from now on a write whose data is that pattern repeated is not written but unmapped (see [TRIM mode](#trim-mode)) |
 | `"MMCSDNT "` | `21h` TRIM_MODE_OFF | Back to normal writes |
+| `"MMCSDNT "` | `22h` TRIM_STATUS | `MMC_TRIM_STATUS` after the header: in the path, target and LUN of a card; out whether it is there (bit 0), whether its pattern writes are unmapped (bit 1) and whether the mode is on (bit 2), its block size, and the bytes the adapter unmapped and wrote as data since `TRIM_MODE_ON` |
 | `"MMCSDNT "` | `10h` POWER_DOWN | Flush, deselect, clock and bus power off on every slot. GET_INFO does not wake the controller; any other request does |
 | `"MMCSDNT "` | `11h` POWER_UP | Set the slots up again (as after `ScsiRestartAdapter`) |
 
@@ -549,7 +567,7 @@ eMMC 5.1 cards can queue up to 32 tasks; SoC hosts with a command queuing engine
 
 ### TRIM mode
 
-Windows versions before 7 never send TRIM/UNMAP for deleted files. `TRIM_MODE_ON` (above) gives the driver a 4 KB pattern; while the mode is on, a write whose data is that pattern repeated over the whole request is unmapped (DISCARD, TRIM or ERASE, as UNMAP) instead of written. `tools\trimnt.exe <drive letter>` uses this: it switches the mode on with a random pattern on every AHCINT, IDENT, MMCSDNT and NVMENT adapter, fills the free space of the volume with files of the pattern (unbuffered, write-through), switches the mode off and deletes the files. Other writes are written normally all the time.
+Windows versions before 7 never send TRIM. `TRIM_MODE_ON` gives the driver a 4 KB pattern; while the mode is on, a write whose data is that pattern repeated from its first byte is unmapped (DISCARD, TRIM or ERASE, as UNMAP) instead of written. Any length counts: a file system splits a write where the free space is fragmented, and every piece of the 512-byte-periodic pattern still matches. On a disk that cannot unmap (`TRIM=0`, write protected) the pattern writes are written and counted. `tools\trimnt.exe <drive letter>` finds the disk the volume is on (`IOCTL_SCSI_GET_ADDRESS` through the file system), asks its driver with `TRIM_STATUS` whether that disk takes TRIM (and stops with a message when it does not), switches the mode on with a random pattern (512 random bytes repeated to 4 KB) on that adapter, fills the free space of the volume with files of the pattern in a `TRIMNT.TMP` directory (unbuffered and write-through, so every write reaches the driver), shows the free space before, the amount filled and the amount the driver discarded, switches the mode off and deletes the files. A full volume (`ERROR_DISK_FULL`, error 112) is the normal end of the fill, not an error. When the disk of the volume cannot be found (a volume set, an older system) the mode goes on on every AHCINT, IDENT, MMCSDNT and NVMENT adapter, as before. Ctrl+C stops it early; the mode is switched off and the files deleted as usual. Other writes are written normally all the time.
 
 ### In-driver ACPI
 
@@ -565,7 +583,7 @@ The host is then driven like a PCI one: on NT 3.1–4.0 as an adapter on the EIS
 ### Windows 9x specifics
 
 - **One adapter per device node:** `SCSIPORT.PDR` calls `HwFindAdapter` once per device node; a PCI function with several slots is one adapter (one target per slot). `*Again` is not honoured there, so a host only ACPI describes needs its own device node (98/Me: the ACPI node; 95: the manually installed "ACPI host" device).
-- **Interrupts** from the device node, as on NT (up to 1.2.0.0 only with `IRQ=1`); `IRQ=0` in `AdapterSettings` turns them off.
+- **Interrupts** from the device node, as on NT (up to 1.2 only with `IRQ=1`); `IRQ=0` in `AdapterSettings` turns them off.
 - **`HW_INITIALIZATION_DATA` size:** `SCSIPORT.PDR` (4.00.952 of Windows 95 RTM and 4.00.1112 of the AMDK6 update alike) fails `ScsiPortInitialize` for a structure larger than 4Ch bytes before any `HwFindAdapter` call ("Init Failure"); the cross-compiler's headers declare 50h, so the 9X build passes 4Ch.
 - **`HwAdapterState`:** provided because leaving it `NULL` makes `SCSIPORT.PDR` report "Init Failure" for the miniport. A restore makes the next request set the cards up again.
 - **Memory-mapped registers:** mapped with `_MapPhysToLinear`, since `ScsiPortGetDeviceBase` of `SCSIPORT.PDR` does not map memory reliably (KB Q169584).
@@ -593,7 +611,7 @@ A card whose last block is `FFFFFFFFh` (an SDXC card of the full 2 TB) does not 
 
 - **PnP adapter:** the PCI bus driver, or ACPI, enumerates the host and ScsiPort starts MMCSDNT with its resources: the memory BARs (or the `_CRS` memory range) and the interrupt.
 - **ACPI device nodes and ScsiPort:** ScsiPort finds the `HW_INITIALIZATION_DATA` for a device by the device's bus type: a `LegacyInterfaceType` value under the device's hardware key, a bus type GUID it knows, or the legacy bus type the bus driver reports — and **Isa** when none of these gives one, which is the case for ACPI device nodes. `DriverEntry` therefore calls `ScsiPortInitialize` for `PCIBus`, `Internal`, `Isa` and `PNPBus`, and the service has `Parameters\PnpInterface` entries for all four (`5`, `0`, `1`, `15`), so that ScsiPort treats each as Plug and Play and runs no legacy detection. ScsiPort 5.0 reads the value names into one buffer without clearing it, so a short name after a longer one keeps the longer one's tail (`"1"` after `"15"` reads as 15): the names are written shortest first (`0`, `1`, `5`, `15`).
-- **Text-mode setup (F6):** the setup kernel boots with a bare `MMCSDNT` service key; the `[Config]` values of `txtsetup.oem` are written only to the installed system. `DriverEntry` therefore creates `Parameters\PnpInterface` when the key does not exist yet, before `ScsiPortInitialize`: `5` (PCI) always, and `0`, `1` and `15` only when the ACPI tree has an SD host node (a key under `Enum\ACPI` for one of the ids of `mmcsdnt.inf`). `ScsiPortInitialize` is then called for `Internal`, `Isa` and `PNPBus` only where `PnpInterface` lists them, so on a machine without such a node the driver registers for PCI alone, as AHCINT, IDENT and NVMENT do (1.1.0.0 registered all four bus types on every machine; see the version history).
+- **Text-mode setup (F6):** the setup kernel boots with a bare `MMCSDNT` service key; the `[Config]` values of `txtsetup.oem` are written only to the installed system. `DriverEntry` therefore creates `Parameters\PnpInterface` when the key does not exist yet, before `ScsiPortInitialize`: `5` (PCI) always, and `0`, `1` and `15` only when the ACPI tree has an SD host node (a key under `Enum\ACPI` for one of the ids of `mmcsdnt.inf`). `ScsiPortInitialize` is then called for `Internal`, `Isa` and `PNPBus` only where `PnpInterface` lists them, so on a machine without such a node the driver registers for PCI alone, as AHCINT, IDENT and NVMENT do (1.1 registered all four bus types on every machine; see the version history).
 - **Hibernation:** tested with data cards on Windows 2000 (two cycles) and XP x64 (one cycle). S3/S4 need every device to agree. A VGA adapter without a driver (VgaSave) vetoes them, which has nothing to do with MMCSDNT; under QEMU, `-vga cirrus` with the in-box Cirrus Logic 5446 driver (Windows 2000) or the in-box *Standard VGA Graphics Adapter* (`display.inf`, `vgapnp.sys`) on the std VGA (XP x64, installed by hand when Windows did not pick it) lets S4 through.
 
 ### Command timeout
@@ -611,18 +629,32 @@ A Fast Polling read or write is polled until the SRB's `TimeOutValue` minus one 
 | `MMC_NT31_COMPAT` | NT build only (set by `mmcsd.h` for `MMC_NT4` without `MMC_W9X`) | Windows NT 3.1 support in the same binary, see [Windows NT 3.1 specifics](#windows-nt-31-specifics) |
 | none | 2000/XP/2003 x86 and x64 | PnP resources; auto-sense; `HwAdapterControl`; crash dump / hibernation; `Parameters\PnpInterface` |
 
+### Controller quirks
+
+`MmcPciQuirks` gives each PCI function a set of `MMC_QUIRK_xxx` flags from its vendor, device, revision and subsystem IDs, after Linux's `sdhci-pci` fixes; `MmcPciChipSetup` does the configuration-space set-up (JMicron card power, O2 Micro registers) when the controller is found and again after a power transition. The flags change the reset (clock on first, none without a card, lines after each request), the power-on (one write, 10 ms delay), the capabilities register (Ricoh), the DMA mode (PIO, no ADMA2, no 64-bit DMA) and the UHS-I modes (no DDR50). Of the two interfaces a JMicron JMB38x/JMB388 offers for the same slot, only the MMC one is taken; on 2000/XP/x64 and 9x the SD interface's device then fails to start. Checked in QEMU with the IDs of a Ricoh, an ENE and a JMicron controller on QEMU's SDHCI (the code paths only; QEMU does not reproduce the hardware errors).
+
 ### Memory Allocation
 
-- **DMA area** – one uncached allocation per adapter (`ScsiPortGetUncachedExtension`): one page per slot for the scratch buffer (EXT_CSD, SCR, switch status, SD status, VERIFY data), the ADMA2 tables (1 KB per slot, four per page), one page of alignment slack, with command queuing in use three pages per slot for the task descriptor list and the transfer descriptors, and on an SDMA-only host a 64 KB bounce buffer; every page gets its own physical address
+- **DMA area** – one uncached allocation per adapter (`ScsiPortGetUncachedExtension`): one page per slot for the scratch buffer (EXT_CSD, SCR, switch status, SD status, VERIFY data), the ADMA2 tables (2 KB per slot, two per page; 1 KB and four per page on 9x), one page of alignment slack, with command queuing in use five pages per slot for the task descriptor list and the transfer descriptors (2 KB per task), and on an SDMA-only host a 64 KB bounce buffer; every page gets its own physical address
 - **SDMA** – one transfer goes to as many bounce pages as follow each other physically without crossing a 512 KB boundary (the SDMA buffer boundary the driver programs), at most 64 KB
 - **Above 4 GB** – with 64-bit ADMA2 the DMA area may lie anywhere; otherwise a page of it without a physical address below 4 GB turns DMA off for the adapter (PIO, which uses the same pages through their virtual addresses); the adapter still starts
 - **Device extension** – one `HW_DEVICE_EXTENSION` per adapter with six `MMC_SLOT`s
 
 ## Version history
 
-### 1.2.0.0 — 2026-11-02
+### 1.3 — 2026-11-09
 
-- Text-mode setup of 2000/XP x86 with MMCSDNT integrated into the CD stopped at "Setup is starting Windows" on a machine without SD/MMC hardware (reported). On the bare service key of text-mode setup, 1.1.0.0 registered for the bus types of ACPI device nodes (`Internal`, `Isa`, `PNPBus`) as well as PCI on every machine, the one thing it did there that AHCINT, IDENT and NVMENT (which set up fine on that machine) do not. It now registers for PCI only, and for the ACPI bus types only when the ACPI tree has an SD host node; `ScsiPortInitialize` is called only for the bus types `Parameters\PnpInterface` lists. The hang could not be reproduced in QEMU (Windows 2000 with MMCSDNT as a boot driver, XP x64 text-mode setup with MMCSDNT integrated, with and without an SD host, with an ACPI SD host node), so this needs confirming on the reporting machine.
+- Windows Vista and 7: the 2000/XP driver installs and runs there (Windows 7 SP1 x86: the SDHCI controller with an SD card, files read through the driver). The amd64 driver carries a test signature for 64-bit Vista and later in test mode (`bin\2KXP\ages2001test.cer`). See [Windows Vista / 7 and later](#windows-vista--7-and-later).
+- Controller quirks after Linux's `sdhci-pci`: Ricoh, ENE, JMicron, O2 Micro, VIA and Realtek RTS5250 controllers get the fixes they need (reset, power, capabilities, DMA mode, JMicron interface choice and card power, O2 Micro set-up). See [Controller quirks](#controller-quirks).
+- `trimnt` (IDENT GitHub issue #2, "stopped: error 112" under NT 4.0; the tool is shared by the four drivers): a full volume (`ERROR_DISK_FULL`, 112) is reported as the normal end of the fill, with the free space before and the amount the driver actually discarded. The tool finds the card of the volume (`IOCTL_SCSI_GET_ADDRESS`), asks the new `TRIM_STATUS` IOCTL whether it takes it (`TRIM=0` or a write-protected card is reported instead of filled), switches TRIM mode on only on that adapter, writes into a `TRIMNT.TMP` directory (8.3 names, `TRIM0000.TMP` to `TRIMFFFF.TMP`, so FAT under NT 3.1, which has no long names, works too; the earlier `TRIM00000.TMP` failed there with error 123) and fills the last space cluster by cluster. See [TRIM mode](#trim-mode).
+- TRIM mode: a pattern write of any length is unmapped (before: at least 4 KB, and only the pieces of a fragmented fill that began on a 4 KB boundary of the pattern); `trimnt`'s pattern repeats every 512 bytes, so every piece the file system makes still matches. `TRIM_STATUS` (`22h`) returns, for a card address, whether its pattern writes are unmapped and the bytes unmapped and written since `TRIM_MODE_ON`.
+- 512 KB per request instead of 128 KB on NT 3.1–4.0 and 2000/XP/x64 (160 ADMA2 descriptors per slot, 128 physical breaks; command queuing tasks with 160 transfer descriptors each); 9x keeps 128 KB, an SDMA-only host 64 KB per command.
+- NT family: the driver marks its own service key with `NotInboxDriver = 1` (REG_DWORD) at every start. IDENT 1.3, which turns the in-box `atdisk` and `atapi` off on NT 3.1–4.0, leaves an `atapi` service with that value alone, so this driver copied over `atapi.sys` (with the system disk on it) is not switched off when IDENT is installed next to it (IDENT 1.2 did that; on NT 3.51 the next boot stopped with `0x7B`).
+- Windows 9x: the 9x loader does not clear a driver's uninitialized data (found in IDENT, GitHub pull request #3 there). `DriverEntry` of the 9x build now clears every global it reads before setting it, and the MinGW build of the `.mpd` keeps no uninitialized section (`.bss` goes into `.data`, zeros in the file).
+
+### 1.2 — 2026-11-02
+
+- Text-mode setup of 2000/XP x86 with MMCSDNT integrated into the CD stopped at "Setup is starting Windows" on a machine without SD/MMC hardware (reported). On the bare service key of text-mode setup, 1.1 registered for the bus types of ACPI device nodes (`Internal`, `Isa`, `PNPBus`) as well as PCI on every machine, the one thing it did there that AHCINT, IDENT and NVMENT (which set up fine on that machine) do not. It now registers for PCI only, and for the ACPI bus types only when the ACPI tree has an SD host node; `ScsiPortInitialize` is called only for the bus types `Parameters\PnpInterface` lists. The hang could not be reproduced in QEMU (Windows 2000 with MMCSDNT as a boot driver, XP x64 text-mode setup with MMCSDNT integrated, with and without an SD host, with an ACPI SD host node), so this needs confirming on the reporting machine.
 - A host whose registers read all zeros (version, capabilities and present state: a controller that is powered off or disabled behind an ACPI node) is no longer taken, and the slot interrupt signals are switched off in `HwFindAdapter`, before ScsiPort connects the interrupt (a BIOS may leave them on).
 - Port program `mmccfg.exe` for Windows NT 3.1–4.0 and 95/98/Me (in `bin\NT` and `bin\9X`; it also runs on 2000/XP): the list and parameter box of the Device Manager page in a window of its own, for the systems that have no such page. On 9x/Me it edits the `AdapterSettings` of the chosen controller. See [Port program](#port-program-nt-3140-9xme).
 - `GET_LOCATION` (`2`) miniport IOCTL: the host's PCI location, used by the port program on NT 3.1–4.0.
@@ -638,7 +670,7 @@ A Fast Polling read or write is polled until the SRB's `TimeOutValue` minus one 
 - RPMB through SECURITY PROTOCOL IN/OUT (protocol ECh, as UFS). See [RPMB](#rpmb).
 - HS400 on by default (`HS400=0` off; it was `HS400=1` to turn it on); eMMC command queuing on by default on Intel PCI hosts with the engine at 200h (`CQ=0` off; `CQ=1`/`CQ=xxx` as before for other hosts).
 
-### 1.1.0.0 — 2026-10-19
+### 1.1 — 2026-10-19
 
 - Device Manager page (**Slots** tab, `mmcsdpp.dll`) for 2000/XP/x64: slots turned off with check boxes instead of `OFF=` typed into the registry; installed by `mmcsdnt.inf` and the F6 disks.
 - `OFF=` turns off single slots, optionally on one PCI host only (by its PCI location); a slot turned off gets no card initialization and no interrupts.
@@ -648,7 +680,7 @@ A Fast Polling read or write is polled until the SRB's `TimeOutValue` minus one 
 - A host whose registers read all ones (powered off or removed) is no longer set up again: requests fail at once instead of running into the timeouts of card initialization, and flush and shutdown requests complete without commands.
 - Shutdown and restart checked on Windows XP x64 after a hang at shutdown was reported there with AHCINT; the x64 build already used ScsiPort's register functions, so the change made to AHCINT and NVMENT was not needed here (see `TESTS.TXT`).
 
-### 1.0.0.0 — 2026-10-12
+### 1.0 — 2026-10-12
 
 - Initial release: SD/SDHC/SDXC and MMC/eMMC on SDHCI hosts (PCI and ACPI-only) for Windows 95/98/Me, NT 3.1–4.0, 2000/XP/2003 x86 and XP x64/2003 x64 from one source tree; every card a fixed, bootable disk.
 - SD High Speed and UHS-I (SDR104, DDR50, SDR50, SDR25) with the 1.8 V switch, tuning and a fallback to 3.3 V; MMC High Speed, eMMC DDR52, HS200 and HS400 (`HS400=1`), each falling back to the next slower mode.

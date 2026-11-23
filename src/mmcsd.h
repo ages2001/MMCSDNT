@@ -57,7 +57,7 @@
 #define MMC_DRIVER_NAME         "MMCSDNT"
 #endif
 
-#define MMC_DRIVER_VERSION      0x01020000  /* 1.2.0.0 */
+#define MMC_DRIVER_VERSION      0x01030000  /* 1.3 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -116,11 +116,19 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 #define MMC_PAGE_SIZE                   4096
 #define MMC_MAX_SLOTS                   6           /* per PCI function (SDHCI) */
 #define MMC_MAX_CONTROLLERS             32
+#if defined(MMC_W9X)
 #define MMC_MAX_TRANSFER                0x20000     /* 128 KB */
-#define MMC_MAX_PHYS_BREAKS             32
-#define MMC_BLOCK_SIZE                  512
 #define MMC_ADMA_ENTRIES                64
 #define MMC_ADMA_TABLE_SIZE             1024        /* 64 descriptors of 8 or 12 bytes */
+#else
+#define MMC_MAX_TRANSFER                0x80000     /* 512 KB */
+#define MMC_ADMA_ENTRIES                160
+#define MMC_ADMA_TABLE_SIZE             2048        /* 160 descriptors of 8 or 12 bytes */
+#endif
+/* An unaligned buffer of the largest transfer spans one page more than it
+   holds; one descriptor per page */
+#define MMC_MAX_PHYS_BREAKS             (MMC_MAX_TRANSFER / 4096)
+#define MMC_BLOCK_SIZE                  512
 #define MMC_ADMA_TABLES_PER_PAGE        (MMC_PAGE_SIZE / MMC_ADMA_TABLE_SIZE)
 #define MMC_SCRATCH_SIZE                4096        /* EXT_CSD, SCR, switch status, VERIFY */
 #define MMC_SDMA_BOUNCE_SIZE            0x10000     /* SDMA-only controllers */
@@ -147,7 +155,8 @@ VOID   ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 #define MMC_CQ_DEFAULT_OFFSET           0x200
 #define MMC_CQ_DEPTH                    8           /* tasks the driver keeps in flight */
 #define MMC_CQ_SLOTS                    32          /* task descriptor list entries */
-#define MMC_CQ_TRD_ENTRIES              64          /* transfer descriptors per task */
+#define MMC_CQ_TRD_ENTRIES              160         /* transfer descriptors per task (512 KB, one per page) */
+#define MMC_CQ_TRD_SIZE                 2048        /* 160 descriptors of 8 or 12 bytes */
 #define CQHCI_VER                       0x00
 #define CQHCI_CAP                       0x04
 #define CQHCI_CFG                       0x08
@@ -628,7 +637,26 @@ typedef struct _MMC_SRB_IO_CONTROL {
 #define MMC_IOCTL_POWER_UP              0x00000011
 #define MMC_IOCTL_TRIM_MODE_ON          0x00000020  /* 4 KB pattern after the header */
 #define MMC_IOCTL_TRIM_MODE_OFF         0x00000021
+#define MMC_IOCTL_TRIM_STATUS           0x00000022  /* MMC_TRIM_STATUS after the header */
 #define MMC_TRIM_PATTERN_SIZE           4096
+
+/* TRIM_STATUS: in the address of a card, out whether its pattern writes
+   become discards and the adapter's byte counts since TRIM_MODE_ON */
+typedef struct _MMC_TRIM_STATUS {
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR Flags;                        /* MMC_TRIM_STATUS_xxx */
+    ULONG BlockSize;                    /* bytes per logical block of the card */
+    ULONG TrimmedLow;                   /* pattern writes discarded / erased */
+    ULONG TrimmedHigh;
+    ULONG WrittenLow;                   /* pattern writes the medium got as data */
+    ULONG WrittenHigh;
+} MMC_TRIM_STATUS, *PMMC_TRIM_STATUS;
+
+#define MMC_TRIM_STATUS_PRESENT         0x01        /* a card at that address */
+#define MMC_TRIM_STATUS_CAN_TRIM        0x02        /* its pattern writes become discards */
+#define MMC_TRIM_STATUS_MODE_ON         0x04
 
 #define MMC_INFO_ASYNC                  0x00000001  /* transfers completed by interrupt */
 #define MMC_INFO_POWERED_DOWN           0x00000002
@@ -707,7 +735,25 @@ typedef struct _MMC_PART {
     ULONG                   Sectors;
 } MMC_PART, *PMMC_PART;
 
+/* Controllers that need more than the SDHCI specification (after Linux
+   drivers/mmc/host/sdhci-pci-core.c and sdhci-pci-o2micro.c) */
+#define MMC_QUIRK_BROKEN_DMA            0x00000001  /* no DMA at all: PIO */
+#define MMC_QUIRK_BROKEN_ADMA           0x00000002  /* no ADMA2: SDMA or PIO */
+#define MMC_QUIRK_32BIT_DMA             0x00000004  /* DMA addresses below 4 GB, dword aligned */
+#define MMC_QUIRK_SINGLE_POWER_WRITE    0x00000008  /* voltage and power on in one write */
+#define MMC_QUIRK_DELAY_AFTER_POWER     0x00000010  /* 10 ms after power on */
+#define MMC_QUIRK_CLOCK_BEFORE_RESET    0x00000020  /* internal clock running for a reset */
+#define MMC_QUIRK_NO_CARD_NO_RESET      0x00000040  /* no full reset without a card */
+#define MMC_QUIRK_RESET_AFTER_REQUEST   0x00000080  /* command and data lines reset after each request */
+#define MMC_QUIRK_RESET_ON_IOS          0x00000100  /* command and data lines reset after clock and bus changes */
+#define MMC_QUIRK_RICOH_CAPS            0x00000200  /* capabilities register wrong: 33 MHz, 3.3 V, SDMA */
+#define MMC_QUIRK_JMICRON_MMC           0x00000400  /* JMicron second interface: enable bit at C0h */
+#define MMC_QUIRK_NO_PRESET             0x00000800  /* preset value registers wrong */
+#define MMC_QUIRK_NO_DDR50              0x00001000  /* DDR50 broken */
+#define MMC_QUIRK_FORCE_DMA             0x00002000  /* SDMA works though the capabilities deny it */
+
 typedef struct _MMC_SLOT {
+    ULONG                   Quirks;         /* MMC_QUIRK_xxx of the controller */
     BOOLEAN                 Present;        /* registers mapped */
     BOOLEAN                 CardReady;      /* card initialized */
     BOOLEAN                 NeedsInit;      /* initialize again before the next request */
@@ -834,6 +880,7 @@ typedef struct _HW_DEVICE_EXTENSION {
     UCHAR                   Irq;
 
     BOOLEAN                 AsyncMode;
+    ULONG                   Quirks;         /* MMC_QUIRK_xxx: controllers that need more than the SDHCI specification */
     BOOLEAN                 DmaAllowed;     /* DMA=0 turns it off */
     BOOLEAN                 Dma64;          /* every slot does 64-bit ADMA2; DMA64=0 turns it off */
     BOOLEAN                 HighSpeedAllowed;   /* HS=0 turns it off */
@@ -848,6 +895,8 @@ typedef struct _HW_DEVICE_EXTENSION {
     UCHAR                   EmmcParts;      /* EMMCPART=1 (boot partitions read-only) or 2 */
     ULONG                   CqOffset;
     BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become discards */
+    ULONG                   TrimmedBytes[2];    /* since TRIM_MODE_ON: low, high */
+    ULONG                   TrimWrittenBytes[2];
     BOOLEAN                 Stopped;
     BOOLEAN                 TimerArmed;
     BOOLEAN                 HotPlug;        /* HOTPLUG=1: cards come and go (removable medium) */
